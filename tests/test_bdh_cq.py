@@ -1,7 +1,10 @@
 import torch
 import pytest
 
-from bdh_cq.bdh_cq import BDH, BDHReasoningWrapper, compute_attn_residual_depth_bias
+from bdh_cq.bdh_cq import (BDH, BDHBlock, BDHReasoningWrapper,
+                           compute_attn_residual_depth_bias, exists)
+from bdh_cq.higher_order_bdh import HigherOrderBDHLayer
+from bdh_cq.rotary import RotaryEmbedding, apply_rotary_emb
 
 MODEL_KWARGS = dict(
     dim = 512,
@@ -10,12 +13,26 @@ MODEL_KWARGS = dict(
     depth = 2
 )
 
-def make_model(**overrides):
-    return BDH(**{**MODEL_KWARGS, **overrides})
+# the higher order layer slots into bdh in place of the order-1 layer, sharing
+# the outer machinery - every e2e test below runs against both
 
-@pytest.fixture
-def wrapper():
-    return BDHReasoningWrapper(make_model())
+BLOCK_CLASSES = [BDHBlock, HigherOrderBDHLayer]
+
+param = pytest.mark.parametrize('block_cls', BLOCK_CLASSES, ids = ['BDH', 'HigherOrder'])
+
+def make_model(block_cls = BDHBlock, **overrides):
+    return BDH(**{**MODEL_KWARGS, 'block_cls': block_cls, **overrides})
+
+def make_wrapper(block_cls = BDHBlock):
+    return BDHReasoningWrapper(make_model(block_cls))
+
+def memory_equal(a, b):
+    # order-1 memories are tensors, order-2 a tuple per layer
+
+    if isinstance(a, tuple):
+        return all(torch.equal(x, y) for x, y in zip(a, b))
+
+    return torch.equal(a, b)
 
 def rand_ids(shape, num = 16):
     return torch.randint(0, num, shape)
@@ -25,8 +42,9 @@ def make_stages(stage_spec):
 
     return [rand_ids(item) if isinstance(item, tuple) else item for item in stage_spec]
 
-def test_bdh_cq():
-    model = make_model(num_tokens = 256)
+@param
+def test_bdh_cq(block_cls):
+    model = make_model(block_cls, num_tokens = 256)
 
     ids = rand_ids((2, 1024), 256)
 
@@ -35,10 +53,11 @@ def test_bdh_cq():
     assert logits.shape == (2, 1024, 256)
     assert model(ids, memories = memories).shape == logits.shape
 
-def test_bdh_cq_latent_reasoning():
+@param
+def test_bdh_cq_latent_reasoning(block_cls):
     # raw model, latent reasoning loop with the memory writes frozen
 
-    model = make_model()
+    model = make_model(block_cls)
 
     _, memories = model(rand_ids((1, 50)), return_memory = True)
 
@@ -52,11 +71,13 @@ def test_bdh_cq_latent_reasoning():
 
 # e2e - tensor stages ingested, int stages latent reasoning, any interleaving
 
+@param
 @pytest.mark.parametrize(('stage_spec', 'logits_shape', 'seen'), [
     ([(2, 20), 8, (2, 30)], (2, 30, 16), 58),
     ([(1, 10), 2, (1, 15), 4, (1, 20)], (1, 20, 16), 51),
 ])
-def test_bdh_reasoning_wrapper(wrapper, stage_spec, logits_shape, seen):
+def test_bdh_reasoning_wrapper(block_cls, stage_spec, logits_shape, seen):
+    wrapper = make_wrapper(block_cls)
 
     logits, memories = wrapper(*make_stages(stage_spec), return_memory = True)
 
@@ -69,6 +90,7 @@ def test_bdh_reasoning_wrapper(wrapper, stage_spec, logits_shape, seen):
 
 # e2e - every latent step predicts the first token of the next segment, every answer position the next answer token
 
+@param
 @pytest.mark.parametrize(('stage_spec', 'seen', 'rejected'), [
     ([(2, 20), 0, (2, 30)], 50, False),
     ([(2, 20), 8, (2, 30)], 58, False),
@@ -76,7 +98,8 @@ def test_bdh_reasoning_wrapper(wrapper, stage_spec, logits_shape, seen):
     ([(2, 10), 4, (2, 15), 5, (2, 20)], 54, False),
     ([(2, 20), 8], None, True),
 ])
-def test_bdh_reasoning_wrapper_loss(wrapper, stage_spec, seen, rejected):
+def test_bdh_reasoning_wrapper_loss(block_cls, stage_spec, seen, rejected):
+    wrapper = make_wrapper(block_cls)
 
     if rejected:
         with pytest.raises(AssertionError):
@@ -91,11 +114,13 @@ def test_bdh_reasoning_wrapper_loss(wrapper, stage_spec, seen, rejected):
 
 # e2e - autoregressive decode seeded from the last latent projection
 
+@param
 @pytest.mark.parametrize(('stage_spec', 'num_tokens', 'stop_token'), [
     ([(1, 10), 2, (1, 15), 4], 8, None),
     ([(1, 10)], 100, 0),
 ])
-def test_bdh_reasoning_wrapper_generate(wrapper, stage_spec, num_tokens, stop_token):
+def test_bdh_reasoning_wrapper_generate(block_cls, stage_spec, num_tokens, stop_token):
+    wrapper = make_wrapper(block_cls)
 
     tokens = wrapper.generate(make_stages(stage_spec), num_tokens = num_tokens, stop_token = stop_token)
 
@@ -111,7 +136,9 @@ def test_bdh_reasoning_wrapper_generate(wrapper, stage_spec, num_tokens, stop_to
     assert memories.tokens_seen == 33
     assert all(0 <= token < 16 for token in first + middle + last)
 
-def test_bdh_reasoning_wrapper_update_memory(wrapper):
+@param
+def test_bdh_reasoning_wrapper_update_memory(block_cls):
+    wrapper = make_wrapper(block_cls)
 
     prompts, answers = rand_ids((2, 20)), rand_ids((2, 30))
 
@@ -120,7 +147,7 @@ def test_bdh_reasoning_wrapper_update_memory(wrapper):
     _, base = wrapper(prompts, return_memory = True)
     _, frozen = wrapper(4, memories = base, return_memory = True, update_latent_memory = False)
 
-    assert all(torch.equal(f, b) for f, b in zip(frozen.fast_weight_memories, base.fast_weight_memories))
+    assert all(memory_equal(f, b) for f, b in zip(frozen.fast_weight_memories, base.fast_weight_memories))
 
     # per-stage flags zip with the stages and override the two bools
 
@@ -132,17 +159,68 @@ def test_bdh_reasoning_wrapper_update_memory(wrapper):
     # a frozen parallel stage writes nothing
 
     _, mem = wrapper(prompts, return_memory = True, update_memory_per_stage = [False])
-    assert all(m is None for m in mem.fast_weight_memories)
+    assert all(not exists(m) for m in mem.fast_weight_memories)
 
     # the spec must cover every stage
 
     with pytest.raises(AssertionError):
         wrapper(prompts, 4, answers, update_memory_per_stage = [True, True])
 
-def test_bdh_attn_residual_recycling():
+def test_apply_rotary_emb_partial():
+    # only the dims covered by the freqs rotate, the rest of the qk dims are untouched
+
+    freqs = RotaryEmbedding(8)(torch.arange(16))
+
+    t = torch.randn(2, 3, 16, 64)
+
+    rotated = apply_rotary_emb(freqs, t)
+
+    assert rotated.shape == t.shape
+    assert not torch.allclose(rotated[..., :8], t[..., :8])
+    assert torch.equal(rotated[..., 8:], t[..., 8:])
+
+    # start_index lifts the rotation to a later slice of the qk dims
+
+    rotated = apply_rotary_emb(freqs, t, start_index = 16)
+
+    assert torch.equal(rotated[..., :16], t[..., :16])
+    assert not torch.allclose(rotated[..., 16:24], t[..., 16:24])
+    assert torch.equal(rotated[..., 24:], t[..., 24:])
+
+    # rotary needs the qk dims, and only rotates at position-dependent freqs
+
+    assert torch.equal(rotated[:, :, 0, 16:24], t[:, :, 0, 16:24])
+
+@param
+def test_partial_rotary(block_cls):
+    # dim_qk is huge, a small slice of it is position-encoded
+
+    model = make_model(block_cls, dim_qk_heads = 512, rotary_dim = 16)
+
+    assert model.rope.freqs.shape == (8,)
+
+    logits, memories = model(rand_ids((2, 20)), return_memory = True)
+
+    assert logits.shape == (2, 20, 16)
+    assert memories.embeds.shape == (2, 20, 512)
+
+    loss = logits.float().mean()
+    loss.backward()
+
+    assert exists(model.block.proj_up.grad)
+
+    # rotary_dim 0 disables position embeddings entirely
+
+    model = make_model(block_cls, dim_qk_heads = 512, rotary_dim = 0)
+
+    assert not exists(model.rope)
+    assert model(rand_ids((2, 20))).shape == (2, 20, 16)
+
+@param
+def test_attn_residual_recycling(block_cls):
     # alphafold2 style recycling - attend over the previous pass's per-layer hiddens
 
-    model = make_model(attn_residual = True)
+    model = make_model(block_cls, attn_residual = True)
 
     tokens = rand_ids((1, 10))
 
@@ -156,21 +234,22 @@ def test_bdh_attn_residual_recycling():
     with pytest.raises(AssertionError):
         model(tokens[:, :-1], all_block_outputs = hiddens)
 
-def test_bdh_attn_residual_depth_bias_wiring():
+@param
+def test_attn_residual_depth_bias_wiring(block_cls):
     # latent hiddens aware of their distance from the end of reasoning
 
     prompts, answers = rand_ids((2, 20)), rand_ids((2, 30))
 
-    model = make_model(depth = 4, attn_residual = True, attn_residual_depth_bias_distance = 2)
+    model = make_model(block_cls, depth = 4, attn_residual = True, attn_residual_depth_bias_distance = 2)
     loss = BDHReasoningWrapper(model)(prompts, 3, answers, return_loss = True)
     loss.backward()
 
     assert model.attn_residual.has_depth_bias_distance
-    assert model.attn_residual.depth_bias.grad is not None
+    assert exists(model.attn_residual.depth_bias.grad)
 
     # off at a distance of 0
 
-    model = make_model(depth = 4, attn_residual = True)
+    model = make_model(block_cls, depth = 4, attn_residual = True)
     loss = BDHReasoningWrapper(model)(prompts, 3, answers, return_loss = True)
     loss.backward()
 

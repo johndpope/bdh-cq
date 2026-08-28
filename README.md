@@ -89,3 +89,12 @@ answer = wrapper.generate(prompts, 8, num_tokens = 32, stop_token = 0)
     url     = {https://arxiv.org/abs/2601.21582},
 }
 ```
+
+```bibtex
+@inproceedings{chakrabarti2026poly,
+    title   = {Poly-attention: a general scheme for higher-order self-attention},
+    author  = {Chakrabarti, Sayak and Pitassi, Toniann and Alman, Josh},
+    booktitle = {International Conference on Learning Representations (ICLR)},
+    year    = {2026}
+}
+```

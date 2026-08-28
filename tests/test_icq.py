@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from bdh_cq.bdh_cq import BDHReasoningWrapper
+from bdh_cq.bdh_cq import BDHReasoningWrapper, exists
 from bdh_cq.icq import (make_model, encode_grid, encode_output, decode_grid,
                         task_prompt, task_answer, answer_length, task_at_level,
                         ingest, ingest_hiddens, generate_answer, solve,
@@ -136,7 +136,7 @@ def test_train_loss(wrapper):
     assert loss.ndim == 0
     assert loss.item() >= 0
     assert all(
-        param.grad is not None
+        exists(param.grad)
         for param in wrapper.parameters()
         if param.requires_grad
     )

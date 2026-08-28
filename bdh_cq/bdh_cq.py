@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
-from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+from bdh_cq.rotary import RotaryEmbedding, apply_rotary_emb
 
 # constants
 
@@ -250,6 +250,12 @@ class BDHBlock(Module):
 
         return out, memories
 
+    # the order-1 memory is a single tensor per layer
+
+    @staticmethod
+    def combine_memories(new_memory, prev_memory):
+        return new_memory + default(prev_memory, 0.)
+
 # main bdh
 
 class BDH(Module):
@@ -261,6 +267,10 @@ class BDH(Module):
         depth = 8,
         heads = 4,
         dim_qk_heads = 32_768, # their neurons is the dim_qk * heads
+        rotary_dim = 64, # dims of each qk head carrying position info; dim_qk is huge here, so a small slice suffices
+        block_cls = BDHBlock, # the order-1 block by default - the higher order layer slots in here
+        qk_activation = nn.ReLU(),
+        ff_activation = nn.ReLU(),
         attn_residual = False,
         attn_residual_tied = True,
         attn_residual_depth_bias_distance = 0,
@@ -269,18 +279,29 @@ class BDH(Module):
         assert divisible_by(dim_qk_heads, heads)
         dim_qk = dim_qk_heads // heads
 
+        assert divisible_by(rotary_dim, 2), 'rotary_dim must be even, as position embeddings rotate pairs of dims'
+        assert rotary_dim <= dim_qk
+
         self.dim = dim
         self.token_embed = Embedding(num_tokens, dim)
 
-        self.rope = RotaryEmbedding(dim_qk // 2)
+        self.rotary_dim = rotary_dim
+
+        self.rope = None
+
+        if rotary_dim > 0:
+            self.rope = RotaryEmbedding(rotary_dim)
+
         self.depth = depth
 
         self.post_embed_norm = LayerNormNoParams(dim)
 
-        self.block = BDHBlock(
+        self.block = block_cls(
             dim,
             heads = heads,
-            dim_queries_keys = dim_qk
+            dim_queries_keys = dim_qk,
+            qk_activation = qk_activation,
+            ff_activation = ff_activation
         )
 
         self.post_norm = LayerNormNoParams(dim)
@@ -346,7 +367,7 @@ class BDH(Module):
 
         seq = torch.arange(seq_len, device = device) + tokens_seen
 
-        pos_emb = self.rope(seq)
+        pos_emb = self.rope(seq) if exists(self.rope) else None
 
         # memories
 
@@ -396,7 +417,7 @@ class BDH(Module):
             # the memory update can be frozen with `update_memory` (section 3.3)
 
             if update_memory:
-                next_memory = layer_memory + default(prev_memory, 0.)
+                next_memory = self.block.combine_memories(layer_memory, prev_memory)
             else:
                 next_memory = prev_memory
 
