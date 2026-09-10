@@ -868,10 +868,42 @@ class BDHVideoReasoningWrapper(Module):
         # copy mode: salient cells of the query still are the occupancy prior
         # (stamp anchors are gray markers, recolor target is the sprite blob).
         self._occ_prior = None
+        self._copy_tgt = None
+        self._sprite_app = None
         if self.motion_rank == 0 and self.decode == "copy":
-            energy = energy_map(still)
+            energy = energy_map(still)  # (B, T, H, W)
             peak = energy.flatten(2).amax(dim=-1).clamp_min(1e-8)[..., None, None]
-            self._occ_prior = (energy >= OCC_FRAC * peak).to(still.dtype).detach()
+            prior = (energy >= OCC_FRAC * peak).to(still.dtype)
+            self._occ_prior = prior.detach()
+            mp = torch.nn.functional.max_pool2d
+            # Source region = the salient component 8-connected to the sprite
+            # centroid (flood-fill within `prior`). identity / recolor are one
+            # component -> no targets; stamp_copy's anchors are separate.
+            src = self._source_yx.to(still.dtype).round().long().clamp_min(0)  # (B,2)
+            src[:, 0].clamp_(max=self.latent_h - 1)
+            src[:, 1].clamp_(max=self.latent_w - 1)
+            prior2d = prior[:, 0]  # (B, H, W)
+            seed = torch.zeros_like(prior2d)
+            bidx = torch.arange(still.shape[0], device=still.device)
+            seed[bidx, src[:, 0], src[:, 1]] = 1.0
+            seed = seed[:, None]
+            p2 = prior2d[:, None]
+            for _ in range(2 * max(self.latent_h, self.latent_w)):
+                seed = mp(seed, 3, stride=1, padding=1) * p2
+            marker = (p2 * (1.0 - seed)).clamp(0, 1)  # (B, 1, H, W) anchor markers
+            # The gray marker is the top-left 8px of the 16px stamp; the sprite
+            # footprint is the 2x2 cells down-right of it. Dilate that way only.
+            tgt = marker.clone()
+            tgt[..., 1:, :] = torch.maximum(tgt[..., 1:, :], marker[..., :-1, :])
+            tgt[..., :, 1:] = torch.maximum(tgt[..., :, 1:], tgt[..., :, :-1].clone())
+            self._copy_tgt = tgt.expand(-1, self.latent_t, -1, -1).contiguous().detach()
+            # Pooled source appearance (the sprite colour), (B, C, 1, 1, 1).
+            src_cells = (energy[:, 0] >= 0.5 * peak[:, 0]).to(still.dtype)  # (B, H, W)
+            m = src_cells[:, None, None]  # (B, 1, 1, H, W)
+            denom = m.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0)
+            self._sprite_app = (
+                (still[:, :, :1] * m).sum(dim=(-2, -1), keepdim=True) / denom
+            ).detach()
         return Memory(memories.tokens_seen, embeds, memories.fast_weight_memories)
 
     def _occ_sigma(self) -> Tensor:
@@ -945,9 +977,10 @@ class BDHVideoReasoningWrapper(Module):
         if self.motion_rank < 0:
             raise RuntimeError("shift head warps the still in reason(); not to_latent_volume")
         if self.motion_rank <= 0 and self.decode == "copy":
-            # Still broadcast over T plus a gated appearance residual. Occupancy
-            # is per-cell to_occupancy biased by the query still's own support
-            # (_copy_logits) — the per-cell Linear alone stays near-uniform.
+            # Attention-copy: paste the source sprite's pooled appearance onto
+            # the other salient cells (stamp anchors), then add a gated learned
+            # residual for blob detail. Per-cell to_latent alone cannot move
+            # appearance from the source cells to the anchors.
             appearance = self.to_latent(hidden)
             logits = self._copy_logits(hidden)
             gate = rearrange(
@@ -966,6 +999,12 @@ class BDHVideoReasoningWrapper(Module):
                 return residual
             still = still.to(device=hidden.device, dtype=hidden.dtype)
             base = still[:, :, :1].expand(-1, -1, self.latent_t, -1, -1)
+            tgt = getattr(self, "_copy_tgt", None)
+            sprite_app = getattr(self, "_sprite_app", None)
+            if tgt is not None and sprite_app is not None:
+                tgt = tgt.to(device=still.device, dtype=still.dtype)[:, None]  # (B,1,T,H,W)
+                sprite_app = sprite_app.to(device=still.device, dtype=still.dtype)
+                base = base * (1.0 - tgt) + sprite_app * tgt
             return base + residual
         if self.motion_rank <= 0:
             appearance = self.to_latent(hidden)

@@ -1,6 +1,13 @@
 # Handoff: BDH-CQ video ICQ (sprites + talking heads)
 
-**Status:** Sprite **train-query last frame passed**. Held-out: **`identity` passes** (2026-09-10, `decode=copy`); `translate` direction is exact but magnitude is capped by the unobservable query level; `stamp_copy` / `pan` / `translate_pan` / `recolor` still fail (see "Held-out generalization" below — each is a specific decode gap, not a config). Talking-head last frame **never passed** (idle/smear vs laugh). 1B on msi **ran and still failed** last frame. GPU is idle.
+**Status:** Sprite **train-query last frame passed**. Held-out (2026-09-10),
+`decode=copy` attention-copy: **`identity`, `stamp_copy`, `recolor` all EXIT 0**
+(recolor's gate is soft — see below). `translate` direction is exact but
+magnitude is capped by the unobservable query level. `pan` / `translate_pan`
+are decode-fidelity bound on the FakeVAE latent. See "Held-out generalization"
+below — each remaining one is a specific gap, not a config. Talking-head last
+frame **never passed** (idle/smear vs laugh). 1B on msi **ran and still
+failed** last frame.
 
 **Product pass is visual, not pytest.** A still, a gray wash, a flood, or a closed mouth next to GT teeth is a fail even if CLIP_FAIL is clear, tL1 looks fine, or PSNR is ~16–28.
 
@@ -112,25 +119,29 @@ information ceiling; the fixes are overlapping `test_levels`/`demo_levels` or a
 2-frame query, both change the family.
 
 **`copy`** (`identity`, `stamp_copy`, `recolor`) — no rigid motion; the answer
-edits the still in place. Decode is `still_broadcast + spatial_softmax_gate(
-to_occupancy + occ_prior) · to_latent(hidden)`, `lock_t0` for `t=0`. `occ_prior`
-= the query still's own support (`energy ≥ OCC_FRAC·peak`), a strong prior
-because stamp anchors / the recolor sprite are already salient in `H_0` (the
-per-cell `to_occupancy` alone stays near-uniform, same failure as `shift`
-occupancy). `res_l2` is dropped for copy mode — there the residual *is* the
-answer.
-  - `identity` — **solved** (trainer EXIT 0): held-out `mse 0.0000`,
-    `identity_probe True`, `lastL1 0.002`. Zero-init `to_latent` returns
-    `still_broadcast`, which *is* the identity answer, so it starts near-perfect.
-  - `stamp_copy` — **still fails** (held-out `lastL1 0.10`, `mse` flat at 0.003
-    over 240 steps). The occ_prior localizes the anchor cells correctly, but
-    the *appearance* at an anchor has to be **the source sprite's pixels copied
-    there** — a src→anchor gather the per-cell `to_latent(hidden)` cannot do.
-    Needs an attention-copy decode (`out[anchor] = still[src]`), not a per-cell
-    regression. This is the real remaining work for the copy path.
-  - `recolor` — copy mode runs, but a color swap over ~6% of pixels is a
-    sub-gate mean-L1 change; the last-frame gate can't score it. Needs
-    `recolor_probe` (already in `video_probes.py`) wired into the gate.
+edits the still in place. Decode = **attention-copy**: `still_broadcast`, then
+paste the pooled source-sprite appearance onto the copy targets, then add a
+gated `to_latent(hidden)` residual for detail; `lock_t0` for `t=0`.
+  - **Source vs targets** — flood-fill from the sprite centroid within the
+    still's support (`energy ≥ OCC_FRAC·peak`) isolates the source component.
+    `identity` / `recolor` are one blob → **no targets**, decode falls back to
+    `still_broadcast + residual`. `stamp_copy`'s anchors are separate
+    components → they are the copy targets, each anchor marker dilated
+    **down-right** to the 2×2 stamp footprint (`_copy_tgt` in `ingest_task`).
+  - `occ_prior` biases the residual gate toward the still's support (the
+    per-cell `to_occupancy` alone stays near-uniform). `res_l2` is dropped for
+    copy mode — there the residual *is* the edit.
+  - `identity` — **solved** (EXIT 0): held-out `mse 0.0000`, `lastL1 0.002`.
+  - `stamp_copy` — **solved** (EXIT 0): held-out `lastL1 0.016`, `mse 0.0011`,
+    all step evals `clip`. The attention-copy clears the gate **untrained**
+    (`lastL1` 0.0003–0.007 on seeds 0–3); training only firms it up. This
+    replaces the earlier per-cell `to_latent` which was flat at `mse 0.003`.
+  - `recolor` — **EXIT 0** (held-out `lastL1 0.020`, `mse 0.0004`,
+    `identity_probe True` — the residual learned the A→B swap). But the pass is
+    **soft**: a color change over ~6% of pixels is a sub-gate mean-L1 move
+    either way, and the per-step evals bounce across the 8/255 line
+    (0.015–0.030). Wire `recolor_probe` (already in `video_probes.py`) into
+    `last_frame_mismatch` before trusting this gate.
 
 **`pan`** (`pan`, `translate_pan`) — `composite_pan` / `composite_translate_pan`
 are implemented and oracle-tested; `decode="pan"` uses full-frame `warp_still`
@@ -188,10 +199,9 @@ More parameters did not open the mouth. Sprite pass was a head change, not scale
 
 ## Suggested next work (in order)
 
-1. **`stamp_copy` src→anchor gather** — `decode=copy` + occ_prior gets the
-   anchor *locations*; the anchor *appearance* must be the source sprite copied
-   there. Add an attention-copy head (`out[anchor] ← still[src]`) instead of
-   per-cell `to_latent`. Determined task, clean gate — the best next win.
+1. **`recolor` gate** — wire `recolor_probe` into `last_frame_mismatch`; mean
+   pixel L1 cannot score a fill A→B swap over ~6% of the frame. Decode already
+   runs (`decode=copy`, no copy targets, residual does the recolor).
 2. **`translate` magnitude** — either accept the ceiling (direction exact,
    ~half of held-out passes) or change the family: overlap `test_levels` with
    `demo_levels`, or feed a 2-frame query so speed is visible. A per-task gain
@@ -199,14 +209,12 @@ More parameters did not open the mouth. Sprite pass was a head change, not scale
 3. **`pan` on the real H3 VAE** — the FakeVAE-latent warp ceiling (oracle
    lastL1 0.036–0.10) may not exist on the H3 latent. `composite_pan` /
    `composite_translate_pan` are ready.
-4. **`recolor` gate** — wire `recolor_probe` into `last_frame_mismatch`; mean
-   pixel L1 cannot score a fill A→B swap over ~6% of the frame.
-5. **Talking-head decode** analogous to the copy path: keep identity from H_0,
+4. **Talking-head decode** analogous to the copy path: keep identity from H_0,
    generate only an expression residual that can make **teeth**. Rank-k /
    IMTalker / 1B Linear volume all failed that.
-6. Do not loosen last-frame to pass a closed mouth. `motL1` on the face, or a
+5. Do not loosen last-frame to pass a closed mouth. `motL1` on the face, or a
    mouth crop, is the talking-head gate.
-7. MSI: `johndpope@msi.local`, VAE `/run/media/johndpope/2TB/minimax-h3-nvfp4/vae/minimax_h3_video_vae_fp16.safetensors`, H3 `/home/johndpope/Documents/GitHub/MiniMax-H3`. Transfer latents `data/icq_transfer/latents_h3_512x288_f22_transfer.pt`.
+6. MSI: `johndpope@msi.local`, VAE `/run/media/johndpope/2TB/minimax-h3-nvfp4/vae/minimax_h3_video_vae_fp16.safetensors`, H3 `/home/johndpope/Documents/GitHub/MiniMax-H3`. Transfer latents `data/icq_transfer/latents_h3_512x288_f22_transfer.pt`.
 
 ---
 

@@ -29,7 +29,7 @@ from bdh_cq.video import (
     sample_task,
     warp_still,
 )
-from bdh_cq.video_probes import LAST_FRAME_L1, pixel_last_frame_l1
+from bdh_cq.video_probes import LAST_FRAME_L1, last_frame_mismatch, pixel_last_frame_l1
 from bdh_cq.video_vae import (
     LATENT_CH,
     LATENT_HW,
@@ -428,6 +428,7 @@ def test_copy_decode_is_still_plus_residual_no_shift(vae):
     )
     mem = wrapper.ingest_task(task)
     assert wrapper._demo_shift is None  # not computed in copy mode
+    assert int(wrapper._copy_tgt.sum()) == 0  # identity: one blob, no copy targets
     z = wrapper.reason(mem, 2, still=task["query_in"])
     # zero-init to_latent -> residual 0 -> volume is the broadcast still
     assert torch.allclose(z, task["query_in"][:, :, :1].expand_as(z), atol=1e-5)
@@ -435,23 +436,24 @@ def test_copy_decode_is_still_plus_residual_no_shift(vae):
     assert "shift_mse" not in parts
 
 
-def test_copy_decode_learns_stamp_copy_overfit(vae):
-    """copy mode can drive the appearance/occupancy path: overfit stamp_copy
-    last-frame L1 falls well below the untrained still baseline."""
-    task = encode_task(vae, sample_task("stamp_copy", seed=1))
-    wrapper = BDHVideoReasoningWrapper(
-        make_video_model(scale="tiny"), canvas_update_memory=False,
-        motion_rank=0, decode="copy",
-    )
-    opt = torch.optim.AdamW(wrapper.parameters(), lr=1e-2)
-    start = wrapper.train_loss(task, 2, return_parts=True)[1]["last_mse"]
-    for _ in range(60):
-        loss = wrapper.train_loss(task, 2)
-        loss.backward()
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-    end = wrapper.train_loss(task, 2, return_parts=True)[1]["last_mse"]
-    assert end < start * 0.5
+def test_copy_decode_stamp_copy_attention_copy_passes_untrained():
+    """The flood-fill isolates the source sprite from the anchors, and the
+    pooled-sprite paste onto the 2x2 anchor footprints clears the last-frame
+    gate before any training."""
+    vae = FakeVideoVAE(seed=0, spatial=8)  # the real sprite-path geometry
+    for seed in (0, 1, 2, 3):
+        task = encode_task(vae, sample_task("stamp_copy", seed=seed))
+        wrapper = BDHVideoReasoningWrapper(
+            make_video_model(scale="tiny"), canvas_update_memory=False,
+            motion_rank=0, decode="copy",
+        )
+        mem = wrapper.ingest_task(task)
+        assert int(wrapper._copy_tgt.sum()) > 0  # anchors found as copy targets
+        z = wrapper.reason(mem, 4, still=task["query_in"])
+        pred = decode_pixels(vae, z)
+        gt = decode_pixels(vae, task["query_out"])
+        assert pixel_last_frame_l1(pred, gt) <= LAST_FRAME_L1
+        assert not last_frame_mismatch(pred, gt)
 
 
 def test_composite_pan_holds_sprite_scrolls_bg():
