@@ -70,26 +70,33 @@ seen in the demos, a fresh unseen instance at query time); **left = model
 prediction, right = ground truth**, FakeVAE round-trip, ~804k-param `protocol`
 model on CPU.
 
-| family | decode | held-out | clip |
-|---|---|---|---|
-| `identity` | `copy` | ✅ `lastL1` 0.002 | [identity](docs/media/sprite_identity_heldout.mp4) |
-| `stamp_copy` | `copy` (attention-copy) | ✅ `lastL1` 0.016 | [stamp_copy](docs/media/sprite_stamp_copy_heldout.mp4) |
-| `recolor` | `copy` | ✅ `lastL1` 0.020 (soft gate) | [recolor](docs/media/sprite_recolor_heldout.mp4) |
-| `translate` | `shift` | direction exact, magnitude short | [translate held-out](docs/media/sprite_translate_heldout.mp4) · [overfit ref](docs/media/sprite_translate_overfit.mp4) |
+Each clip is **left = model prediction, right = ground truth**, 22 frames at
+128², shown 3× and looped.
+
+| family | decode | held-out |
+|---|---|---|
+| `identity` | `copy` | ✅ `lastL1` 0.002 |
+| `stamp_copy` | `copy` (attention-copy) | ✅ `lastL1` 0.016 |
+| `recolor` | `copy` | ✅ `lastL1` 0.020 (soft gate) |
+| `translate` | `shift` | direction exact, magnitude short |
 
 <table>
 <tr>
-<td align="center"><b>identity</b><br><video src="https://github.com/johndpope/bdh-cq/raw/main/docs/media/sprite_identity_heldout.mp4" width="240" controls loop muted></video></td>
-<td align="center"><b>stamp_copy</b><br><video src="https://github.com/johndpope/bdh-cq/raw/main/docs/media/sprite_stamp_copy_heldout.mp4" width="240" controls loop muted></video></td>
+<td align="center"><b>identity</b><br><img src="docs/media/sprite_identity_heldout.gif" width="320"></td>
+<td align="center"><b>stamp_copy</b><br><img src="docs/media/sprite_stamp_copy_heldout.gif" width="320"></td>
 </tr>
 <tr>
-<td align="center"><b>recolor</b><br><video src="https://github.com/johndpope/bdh-cq/raw/main/docs/media/sprite_recolor_heldout.mp4" width="240" controls loop muted></video></td>
-<td align="center"><b>translate</b> (held-out; direction learned)<br><video src="https://github.com/johndpope/bdh-cq/raw/main/docs/media/sprite_translate_heldout.mp4" width="240" controls loop muted></video></td>
+<td align="center"><b>recolor</b><br><img src="docs/media/sprite_recolor_heldout.gif" width="320"></td>
+<td align="center"><b>translate</b> — held-out, direction learned<br><img src="docs/media/sprite_translate_heldout.gif" width="320"></td>
 </tr>
 </table>
 
-> If the players do not load (older markdown renderers), the table links above
-> download the same `.mp4`s from `docs/media/`.
+`translate` overfit reference (train query, tight fit):
+
+<p align="center"><img src="docs/media/sprite_translate_overfit.gif" width="360"></p>
+
+The source `.mp4`s (and per-step evals) are in each `logs/recon_*/` run
+directory; `docs/media/` keeps the standout ones.
 
 Reproduce (a few seconds each on CPU):
 
