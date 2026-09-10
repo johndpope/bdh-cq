@@ -690,7 +690,16 @@ def run(
             except Exception as exc:
                 line += f"  recon_fail {type(exc).__name__}: {exc}"
             finally:
-                _park_vae(vae_mod, device_t)
+                # Only park when nothing downstream needs the VAE on-device:
+                # aval/icq_transfer pre-cache a latent library and don't call
+                # it again until the next eval; an overfit sprite task reuses
+                # `cached`. A non-overfit VIDEO_TASKS run calls encode_task
+                # fresh every step, so parking here silently forces every
+                # subsequent step's H3 encode onto the CPU (0% GPU util,
+                # minutes/step) instead of erroring - a real stall, not slow
+                # convergence. FakeVAE is cheap on CPU either way.
+                if vae != "h3" or cached is not None or aval_library is not None or transfer_library is not None:
+                    _park_vae(vae_mod, device_t)
             print(line, flush=True)
             torch.save(
                 dict(

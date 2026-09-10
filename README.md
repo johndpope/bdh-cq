@@ -110,12 +110,16 @@ uv run python train_video_icq.py --family stamp_copy --vae fake --device cpu \
 # -> logs/recon_stamp_copy/heldout.mp4  (left = pred, right = GT)
 ```
 
-Not yet passing: `pan` / `translate_pan` — the FakeVAE latent bilinear warp
-floors at `lastL1` ~0.04–0.10 vs the 8/255 gate even with the true motion
-vector, a decode-fidelity ceiling rather than a reasoning one. The fix is the
-real H3 VAE, which needs a CUDA host; the decode ops (`composite_pan`,
-`composite_translate_pan`) are already written and oracle-tested. See the
-handoff doc for the analysis and the exact run command.
+Not yet passing: `pan` / `translate_pan` — the latent bilinear warp
+(`warp_still`/`composite_pan`) floors at `lastL1` ~0.04–0.10 on FakeVAE and
+**~0.12–0.24 on the real H3 VAE** (tested 2026-09-11) even with the true motion
+vector, a decode-fidelity ceiling rather than a reasoning one — the warp
+mechanism assumes each latent cell is a uniform pixel block, true by
+construction for FakeVAE but false for H3's real convolutional latent, so a
+bigger/real VAE makes it worse, not better. Needs a different decode
+mechanism (pixel-space warp + re-encode, or a learned motion token) rather
+than more training or a better VAE. See the handoff doc for the full analysis
+and `scripts/oracle_pan_h3.py` for the oracle repro.
 
 ## Citations
 

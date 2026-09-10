@@ -3,10 +3,12 @@
 **Status:** Sprite **train-query last frame passed**. Held-out (2026-09-10):
 **`identity`, `stamp_copy`, `recolor` (`decode=copy`, attention-copy) and
 `translate` (`decode=shift` + `--query_cue_frames 9`) all EXIT 0** (recolor's
-gate is soft — see below). `pan` / `translate_pan` are decode-fidelity bound
-on the FakeVAE latent — the fix (real H3 VAE) needs msi, code is ready. See
-"Held-out generalization" below. Talking-head last frame **never passed**
-(idle/smear vs laugh). 1B on msi **ran and still failed** last frame.
+gate is soft — see below). `pan` / `translate_pan` **tried on the real H3 VAE
+(2026-09-11, msi) and confirmed blocked** — the `warp_still`/`composite_*`
+decode is structurally wrong for a real conv VAE latent, not fixed by more
+compute; needs a different decode mechanism (see below). Talking-head last
+frame **never passed** (idle/smear vs laugh). 1B on msi **ran and still
+failed** last frame.
 
 **Product pass is visual, not pytest.** A still, a gray wash, a flood, or a closed mouth next to GT teeth is a fail even if CLIP_FAIL is clear, tL1 looks fine, or PSNR is ~16–28.
 
@@ -161,36 +163,49 @@ gated `to_latent(hidden)` residual for detail; `lock_t0` for `t=0`.
 uses full-frame `warp_still` by the scene-centroid shift (the whole scene
 translates together for `pan`).
 
-**Decode-fidelity ceiling on FakeVAE, not reasoning:** the oracle full-frame
-warp of the FakeVAE latent on a `pan` clip floors at **lastL1 0.036–0.10** vs
-the 0.031 gate, *with the true vector* — bilinear warp of a coarse latent +
-the periodic checker + the gradient blur on re-pool. `translate_pan` also
-can't separate sprite motion from the 4-cell-period checker in the centroid.
+**Decode-fidelity ceiling, confirmed on both VAEs (2026-09-11, msi RTX PRO
+4000):** the oracle full-frame warp (true shift vector, no model) floors
+**higher on the real H3 VAE than on FakeVAE**:
 
-**Fix = the real H3 VAE (needs msi — CUDA + H3 weights).** Its trained decoder
-can clean up a warped latent; the FakeVAE `repeat_interleave` decoder cannot.
-The code is ready: `warp_spatial` is now a wrapper arg, set to `VAE_SPATIAL`
-(16) for `--vae h3` in the trainer. Runbook on `johndpope@msi.local`
-(RTX PRO 4000, `MINIMAX_H3_ROOT` / `MINIMAX_H3_VAE` defaults in `video_vae.py`):
+| | oracle `lastL1` (true vector) | gate |
+|---|---|---|
+| FakeVAE (spatial 8) | 0.036–0.10 | 0.031 |
+| **Real H3 VAE (spatial 16, 6 seeds)** | **0.121–0.243, mean 0.173** | 0.031 |
+| Trained (protocol, 40 steps, `--vae h3`, non-overfit) | held-out `lastL1 0.107`, loss rose 10.2→28.9 | 0.031 |
 
-```bash
-# pan — scene translates together, decode is full-frame warp_still
-uv run python train_video_icq.py --family pan --vae h3 --device cuda \
-  --scale protocol --overfit False --steps 200 --eval_every 25 \
-  --min_reasoning 4 --max_reasoning 4 --query_cue_frames 9 --wandb False \
-  --recon_dir logs/recon_pan_h3 --ckpt logs/pan_h3.pt
-# translate_pan — sprite and bg move by different amounts; wire
-# composite_translate_pan into reason() (currently only warp_still is), feed
-# it _demo_shift (sprite) + a bg-region pan vector, then:
-uv run python train_video_icq.py --family translate_pan --vae h3 --device cuda \
-  --scale protocol --overfit False --steps 200 --query_cue_frames 9 \
-  --recon_dir logs/recon_tpan_h3 --ckpt logs/tpan_h3.pt --wandb False
-```
+**H3 does not fix this — it makes it worse, and the reason is structural, not
+a VAE-quality issue.** `warp_still`/`composite_pan` upsample each latent cell
+to a uniform pixel block (`repeat_interleave`), warp in pixel space, then
+`avg_pool2d` back down. That round-trip is exact by construction for
+FakeVAE (its encoder *is* that pooling, run backwards). For H3's real
+convolutional VAE, a latent cell is a mixed receptive field, not a spatial
+block — pretending it is one and warping the fake blocks does not approximate
+what the true shifted latent looks like. More capacity in the decoder cannot
+undo a wrong warp assumption at the input. Do not re-attempt `pan`/
+`translate_pan` with `warp_still`/`composite_*` on either VAE without changing
+this: the fix is a different decode mechanism (candidates: decode to pixels,
+warp the pixels properly, re-encode; or a learned motion token instead of a
+geometric warp), or falling back to a structural gate (`pan_probe` /
+`translate_pan_probe`, already in `video_probes.py` — screen centroid + bg
+phase) instead of last-frame L1.
 
-Check `logs/recon_pan_h3/heldout.mp4` (left = pred, right = GT) and the
-trainer exit code. If the H3 latent still blurs on warp, fall back to a
-structural gate: `pan_probe` / `translate_pan_probe` (already in
-`video_probes.py` — screen centroid + bg phase) instead of the 8/255 L1.
+Repro (`johndpope@msi.local`, RTX PRO 4000, H3 VAE):
+`scripts/oracle_pan_h3.py` (oracle-only, no training) prints the per-seed
+table above; `train_video_icq.py --family pan --vae h3 --device cuda --scale
+protocol --overfit False --steps 40 --query_cue_frames 9` reproduces the
+trained result and exits 2.
+
+**Trainer bug found and fixed along the way:** `_park_vae` unconditionally
+moved the VAE to CPU after every eval. Correct for `aval`/`icq_transfer`
+(pre-cached latent library — VAE isn't needed again until the next eval) and
+harmless for `--vae fake`. For a non-overfit `VIDEO_TASKS` family with
+`--vae h3`, `encode_task` still needs the VAE fresh every step —
+parking it silently forced every subsequent step's H3 encode onto the **CPU**:
+0% GPU utilization, 100%+ CPU, no error, no progress (the first `pan`/H3
+attempt sat like this for 7 minutes before we noticed). Fixed: only park when
+`cached`, `aval_library`, or `transfer_library` is set. After the fix, GPU
+utilization went to 100% and steps ran at ~2s each. If a future H3 sprite run
+looks hung, check `nvidia-smi` before assuming it's just slow.
 
 ### Gate fixes for the still families
 
@@ -241,12 +256,14 @@ More parameters did not open the mouth. Sprite pass was a head change, not scale
 1. **`recolor` gate** — wire `recolor_probe` into `last_frame_mismatch`; mean
    pixel L1 cannot score a fill A→B swap over ~6% of the frame. Decode already
    runs (`decode=copy`, no copy targets, residual does the recolor).
-2. **`pan` / `translate_pan` on the real H3 VAE (needs msi)** — run the two
-   commands in the `pan` section above; `warp_spatial` is already threaded to
-   16 for `--vae h3`. `reason()`'s `decode="pan"` branch calls `warp_still`
-   directly (full-frame); `composite_pan` and `composite_translate_pan` are
-   oracle-tested but **not yet wired into `reason()`** — `translate_pan` needs
-   `composite_translate_pan` wired in plus a bg-region pan-vector measurement.
+2. **`pan` / `translate_pan` decode redesign** — H3 was tried (2026-09-11,
+   msi) and made the warp-floor *worse* (0.17 mean vs FakeVAE 0.036–0.10). The
+   `warp_still`/`composite_*` mechanism itself is the wrong tool for a real
+   VAE latent (see the `pan` section above) — don't rerun the H3 command
+   expecting a different result without changing the decode. Two paths: (a)
+   decode→pixel-warp→re-encode instead of latent-space warp, or (b) a learned
+   motion token (see the `motion_rank>0` IMF path already in `video.py`,
+   currently only wired for `icq_transfer`) instead of a geometric shift.
 3. **`translate` diagonal robustness** — axis-aligned held-out clears the gate
    untrained with the 9-frame cue; diagonal needs the short train it already
    gets. Try `query_cue_frames` 6 vs 12 to see the accuracy/generation-length
@@ -277,6 +294,8 @@ More parameters did not open the mouth. Sprite pass was a head change, not scale
 | Trainer | `train_video_icq.py` |
 | Sprite oracle | `bdh_cq/video_tasks.py` (`SPRITE_SIZE=32`, `BG_LO/HI`, `SPRITE_LO/HI`) |
 | identity held-out pass | `logs/recon_id_v2/heldout.mp4` |
-| stamp_copy held-out fail | `logs/recon_sc_v2/heldout.mp4` |
+| stamp_copy held-out fail (pre-attention-copy) | `logs/recon_sc_v2/heldout.mp4` |
+| stamp_copy held-out pass (attention-copy) | `logs/recon_stamp_copy_v3/heldout.mp4` |
 | translate held-out, pre-cue (direction ok, magnitude off) | `logs/recon_sprite_gen/heldout.mp4` |
 | translate held-out, `--query_cue_frames 9` (EXIT 0) | `logs/recon_translate_cue/heldout.mp4` |
+| pan oracle-vs-trained on real H3 VAE (msi, both fail) | `scripts/oracle_pan_h3.py` |
