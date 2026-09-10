@@ -79,12 +79,12 @@ model on CPU.
 
 <table>
 <tr>
-<td align="center"><b>identity</b><br><video src="https://github.com/johndpope/bdh-cq/raw/docs/handoff-sprite-icq-fixes/docs/media/sprite_identity_heldout.mp4" width="240" controls loop muted></video></td>
-<td align="center"><b>stamp_copy</b><br><video src="https://github.com/johndpope/bdh-cq/raw/docs/handoff-sprite-icq-fixes/docs/media/sprite_stamp_copy_heldout.mp4" width="240" controls loop muted></video></td>
+<td align="center"><b>identity</b><br><video src="https://github.com/johndpope/bdh-cq/raw/main/docs/media/sprite_identity_heldout.mp4" width="240" controls loop muted></video></td>
+<td align="center"><b>stamp_copy</b><br><video src="https://github.com/johndpope/bdh-cq/raw/main/docs/media/sprite_stamp_copy_heldout.mp4" width="240" controls loop muted></video></td>
 </tr>
 <tr>
-<td align="center"><b>recolor</b><br><video src="https://github.com/johndpope/bdh-cq/raw/docs/handoff-sprite-icq-fixes/docs/media/sprite_recolor_heldout.mp4" width="240" controls loop muted></video></td>
-<td align="center"><b>translate</b> (held-out; direction learned)<br><video src="https://github.com/johndpope/bdh-cq/raw/docs/handoff-sprite-icq-fixes/docs/media/sprite_translate_heldout.mp4" width="240" controls loop muted></video></td>
+<td align="center"><b>recolor</b><br><video src="https://github.com/johndpope/bdh-cq/raw/main/docs/media/sprite_recolor_heldout.mp4" width="240" controls loop muted></video></td>
+<td align="center"><b>translate</b> (held-out; direction learned)<br><video src="https://github.com/johndpope/bdh-cq/raw/main/docs/media/sprite_translate_heldout.mp4" width="240" controls loop muted></video></td>
 </tr>
 </table>
 
