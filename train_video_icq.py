@@ -232,6 +232,7 @@ def run(
     canvas_write_s: bool = True,
     motion_rank: int = 0,
     decode: str = "auto",
+    query_cue_frames: int = 0,
     query_id: str = "id_d",
     transfer_action: str = "laugh",
     heldout_query_id: str = "id_c",
@@ -400,11 +401,14 @@ def run(
             )
         _park_vae(vae_mod, device_t)
         print("vae parked on cpu for train", flush=True)
+    # FakeVAE sprite path is spatial 8; the real H3 latent is 16.
+    warp_spatial = 8 if (vae == "fake" and family in VIDEO_TASKS) else 16
     wrapper = BDHVideoReasoningWrapper(
         make_video_model(scale=scale),
         canvas_update_memory=canvas_write_s,
         motion_rank=motion_rank,
         decode=decode,
+        warp_spatial=warp_spatial,
     ).to(device_t)
     use_amp = bool(amp) if amp is not None else (
         device_t.type == "cuda" and scale == "billion"
@@ -521,7 +525,8 @@ def run(
             )
         else:
             cached = encode_task(
-                vae_mod, sample_task(family, seed=seed, **clip_kwargs), device=device_t
+                vae_mod, sample_task(family, seed=seed, **clip_kwargs),
+                device=device_t, query_cue_frames=query_cue_frames,
             )
         print(f"overfit task {cached.get('name')} {cached.get('params')}", flush=True)
 
@@ -561,6 +566,7 @@ def run(
                     vae_mod,
                     sample_task(family, seed=task_seed, **clip_kwargs),
                     device=device_t,
+                    query_cue_frames=query_cue_frames,
                 )
         else:
             task = cached
@@ -758,7 +764,8 @@ def run(
         )
     else:
         held = encode_task(
-            vae_mod, sample_task(family, seed=seed + 10_000, **clip_kwargs), device=device_t
+            vae_mod, sample_task(family, seed=seed + 10_000, **clip_kwargs),
+            device=device_t, query_cue_frames=query_cue_frames,
         )
     held_m = _eval(wrapper, held, max_reasoning)
     print(

@@ -1,13 +1,12 @@
 # Handoff: BDH-CQ video ICQ (sprites + talking heads)
 
-**Status:** Sprite **train-query last frame passed**. Held-out (2026-09-10),
-`decode=copy` attention-copy: **`identity`, `stamp_copy`, `recolor` all EXIT 0**
-(recolor's gate is soft — see below). `translate` direction is exact but
-magnitude is capped by the unobservable query level. `pan` / `translate_pan`
-are decode-fidelity bound on the FakeVAE latent. See "Held-out generalization"
-below — each remaining one is a specific gap, not a config. Talking-head last
-frame **never passed** (idle/smear vs laugh). 1B on msi **ran and still
-failed** last frame.
+**Status:** Sprite **train-query last frame passed**. Held-out (2026-09-10):
+**`identity`, `stamp_copy`, `recolor` (`decode=copy`, attention-copy) and
+`translate` (`decode=shift` + `--query_cue_frames 9`) all EXIT 0** (recolor's
+gate is soft — see below). `pan` / `translate_pan` are decode-fidelity bound
+on the FakeVAE latent — the fix (real H3 VAE) needs msi, code is ready. See
+"Held-out generalization" below. Talking-head last frame **never passed**
+(idle/smear vs laugh). 1B on msi **ran and still failed** last frame.
 
 **Product pass is visual, not pytest.** A still, a gray wash, a flood, or a closed mouth next to GT teeth is a fail even if CLIP_FAIL is clear, tL1 looks fine, or PSNR is ~16–28.
 
@@ -103,20 +102,34 @@ held-out eval (`seed + 10_000`) is the gate. `BDHVideoReasoningWrapper` takes
 `decode={shift,copy,pan}`, auto-routed by family in `train_video_icq.py`
 (`--decode` to override).
 
-**`shift`** (`translate`) — composite the query still by a demo-derived
-`(dy, dx)`. A probe (120 random tasks, untrained protocol) showed the query
-displacement is **not** linearly decodable from `hidden.mean` (held-out R²
-−0.4 / −48) but the **demo-average energy-centroid delta** gives R² 0.91 / 0.93.
-So `ingest_task` stashes `_demo_shift` and `_shift_from_hidden` is
-`demo_to_shift(_demo_shift) + to_centroid(hidden.mean)`, `demo_to_shift` a
-`Linear(2,2)` init `2·I`. Result: **direction exact on every task**; last-frame
-gate passes ~5/9 random tasks and misses the held-out seed by magnitude.
-A per-task gain head (`feat = [source_yx, _demo_shift, hidden.mean]`) was tried
-and **destabilised training** (`shift_mse` 2 → 80) — the demo→query ratio
-varies 1.8–4.0× with the query *level*, and **a still frame does not show
-level (= speed)**. `translate` last-frame exact-match held-out has an
-information ceiling; the fixes are overlapping `test_levels`/`demo_levels` or a
-2-frame query, both change the family.
+**`shift`** (`translate`) — composite the query still by a `(dy, dx)`.
+
+*Direction* was never the problem. A probe (120 random tasks, untrained
+protocol) showed the displacement is **not** linearly decodable from
+`hidden.mean` (held-out R² −0.4 / −48) but the **demo-average energy-centroid
+delta** gives R² 0.91 / 0.93, so `ingest_task` stashes `_demo_shift` and the
+`demo_to_shift` `Linear(2,2)` (init `2·I`) gets direction + axis exact on every
+task.
+
+*Magnitude* is the demo→query ratio (1.8–4.0×), which tracks the query
+**level** (= speed) — **not visible in one still frame**. A per-task gain head
+on `hidden.mean` destabilised training (`shift_mse` 2 → 80). **Fix: a K-frame
+query cue** (`--query_cue_frames 9`): `encode_task` runs the real query clip
+for K frames then freezes it, so the velocity is measurable —
+`query_vel = (energy_centroid(query_in)[:, k_lat] − [:, 0]) / k_lat`,
+extrapolated to the last latent time in `ingest_task` (`_query_shift_from_vel`,
+which then overrides `_demo_shift` and collapses the still to frame 0 for the
+composite). With K=9 the extrapolated vector matches the true shift to ~0.1
+cell and axis-aligned held-out clears the gate **untrained** (`lastL1`
+0.010–0.026); diagonal sits at ~0.04 untrained (the FakeVAE-warp blur is worse
+on the diagonal) and the `to_centroid` residual + `shift_mse` loss pull it
+under with a short train. **EXIT 0** (protocol, 160 steps, non-overfit):
+held-out `lastL1 0.023`, `mse 0.0007`, `identity_probe True`.
+
+This is a task-shape change — the paper's ARC framing is one query input — but a
+single still underdetermines *any* speed-carrying family, and a short real
+prefix is how video generation is actually conditioned. `--query_cue_frames 0`
+keeps the paper split.
 
 **`copy`** (`identity`, `stamp_copy`, `recolor`) — no rigid motion; the answer
 edits the still in place. Decode = **attention-copy**: `still_broadcast`, then
@@ -143,15 +156,41 @@ gated `to_latent(hidden)` residual for detail; `lock_t0` for `t=0`.
     (0.015–0.030). Wire `recolor_probe` (already in `video_probes.py`) into
     `last_frame_mismatch` before trusting this gate.
 
-**`pan`** (`pan`, `translate_pan`) — `composite_pan` / `composite_translate_pan`
-are implemented and oracle-tested; `decode="pan"` uses full-frame `warp_still`
-by the scene-centroid shift (the whole scene translates together for `pan`).
-**Blocked, and it is a decode-fidelity ceiling, not reasoning:** the oracle
-full-frame warp of the FakeVAE latent on a `pan` clip floors at **lastL1
-0.036–0.10** vs the 0.031 gate, *with the true vector*. Bilinear warp of a
-16×16 latent + the checker edges + the gradient blur. `translate_pan` also
-can't separate sprite motion from the periodic checker in the centroid. Needs
-the real H3 VAE (its latent may warp cleanly) or a non-warp decode.
+**`pan`** (`pan`, `translate_pan`) — `composite_pan` /
+`composite_translate_pan` are implemented and oracle-tested; `decode="pan"`
+uses full-frame `warp_still` by the scene-centroid shift (the whole scene
+translates together for `pan`).
+
+**Decode-fidelity ceiling on FakeVAE, not reasoning:** the oracle full-frame
+warp of the FakeVAE latent on a `pan` clip floors at **lastL1 0.036–0.10** vs
+the 0.031 gate, *with the true vector* — bilinear warp of a coarse latent +
+the periodic checker + the gradient blur on re-pool. `translate_pan` also
+can't separate sprite motion from the 4-cell-period checker in the centroid.
+
+**Fix = the real H3 VAE (needs msi — CUDA + H3 weights).** Its trained decoder
+can clean up a warped latent; the FakeVAE `repeat_interleave` decoder cannot.
+The code is ready: `warp_spatial` is now a wrapper arg, set to `VAE_SPATIAL`
+(16) for `--vae h3` in the trainer. Runbook on `johndpope@msi.local`
+(RTX PRO 4000, `MINIMAX_H3_ROOT` / `MINIMAX_H3_VAE` defaults in `video_vae.py`):
+
+```bash
+# pan — scene translates together, decode is full-frame warp_still
+uv run python train_video_icq.py --family pan --vae h3 --device cuda \
+  --scale protocol --overfit False --steps 200 --eval_every 25 \
+  --min_reasoning 4 --max_reasoning 4 --query_cue_frames 9 --wandb False \
+  --recon_dir logs/recon_pan_h3 --ckpt logs/pan_h3.pt
+# translate_pan — sprite and bg move by different amounts; wire
+# composite_translate_pan into reason() (currently only warp_still is), feed
+# it _demo_shift (sprite) + a bg-region pan vector, then:
+uv run python train_video_icq.py --family translate_pan --vae h3 --device cuda \
+  --scale protocol --overfit False --steps 200 --query_cue_frames 9 \
+  --recon_dir logs/recon_tpan_h3 --ckpt logs/tpan_h3.pt --wandb False
+```
+
+Check `logs/recon_pan_h3/heldout.mp4` (left = pred, right = GT) and the
+trainer exit code. If the H3 latent still blurs on warp, fall back to a
+structural gate: `pan_probe` / `translate_pan_probe` (already in
+`video_probes.py` — screen centroid + bg phase) instead of the 8/255 L1.
 
 ### Gate fixes for the still families
 
@@ -202,13 +241,16 @@ More parameters did not open the mouth. Sprite pass was a head change, not scale
 1. **`recolor` gate** — wire `recolor_probe` into `last_frame_mismatch`; mean
    pixel L1 cannot score a fill A→B swap over ~6% of the frame. Decode already
    runs (`decode=copy`, no copy targets, residual does the recolor).
-2. **`translate` magnitude** — either accept the ceiling (direction exact,
-   ~half of held-out passes) or change the family: overlap `test_levels` with
-   `demo_levels`, or feed a 2-frame query so speed is visible. A per-task gain
-   head does not work — level is not in a still frame.
-3. **`pan` on the real H3 VAE** — the FakeVAE-latent warp ceiling (oracle
-   lastL1 0.036–0.10) may not exist on the H3 latent. `composite_pan` /
-   `composite_translate_pan` are ready.
+2. **`pan` / `translate_pan` on the real H3 VAE (needs msi)** — run the two
+   commands in the `pan` section above; `warp_spatial` is already threaded to
+   16 for `--vae h3`. `reason()`'s `decode="pan"` branch calls `warp_still`
+   directly (full-frame); `composite_pan` and `composite_translate_pan` are
+   oracle-tested but **not yet wired into `reason()`** — `translate_pan` needs
+   `composite_translate_pan` wired in plus a bg-region pan-vector measurement.
+3. **`translate` diagonal robustness** — axis-aligned held-out clears the gate
+   untrained with the 9-frame cue; diagonal needs the short train it already
+   gets. Try `query_cue_frames` 6 vs 12 to see the accuracy/generation-length
+   trade (a shorter cue leaves more of the clip to actually generate).
 4. **Talking-head decode** analogous to the copy path: keep identity from H_0,
    generate only an expression residual that can make **teeth**. Rank-k /
    IMTalker / 1B Linear volume all failed that.
@@ -236,4 +278,5 @@ More parameters did not open the mouth. Sprite pass was a head change, not scale
 | Sprite oracle | `bdh_cq/video_tasks.py` (`SPRITE_SIZE=32`, `BG_LO/HI`, `SPRITE_LO/HI`) |
 | identity held-out pass | `logs/recon_id_v2/heldout.mp4` |
 | stamp_copy held-out fail | `logs/recon_sc_v2/heldout.mp4` |
-| translate held-out (direction ok, magnitude off) | `logs/recon_sprite_gen/heldout.mp4` |
+| translate held-out, pre-cue (direction ok, magnitude off) | `logs/recon_sprite_gen/heldout.mp4` |
+| translate held-out, `--query_cue_frames 9` (EXIT 0) | `logs/recon_translate_cue/heldout.mp4` |

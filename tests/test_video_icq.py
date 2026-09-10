@@ -456,6 +456,41 @@ def test_copy_decode_stamp_copy_attention_copy_passes_untrained():
         assert not last_frame_mismatch(pred, gt)
 
 
+def test_translate_2frame_cue_recovers_magnitude_untrained():
+    """A K-frame query cue makes the query's speed observable: the extrapolated
+    velocity matches the true shift and composite_shift clears the gate on
+    held-out seeds before any training (the fix for the level being invisible
+    in one still frame)."""
+    from bdh_cq.video_probes import energy_centroid
+
+    vae = FakeVideoVAE(seed=0, spatial=8)
+    for seed in (10_000, 10_001, 10_002, 10_003):
+        task = encode_task(
+            vae, sample_task("translate", seed=seed), query_cue_frames=9
+        )
+        assert task["query_vel"] is not None
+        true_shift = (
+            energy_centroid(task["query_out"])[:, -1]
+            - energy_centroid(task["query_in"])[:, 0]
+        )[0]
+        wrapper = BDHVideoReasoningWrapper(
+            make_video_model(scale="tiny"), canvas_update_memory=False,
+            motion_rank=0, decode="shift",
+        )
+        mem = wrapper.ingest_task(task)
+        vel = wrapper._query_shift_from_vel[0]
+        assert torch.allclose(vel, true_shift, atol=1.0)  # magnitude recovered
+        z = wrapper.reason(mem, 4, still=task["query_in"])
+        pred = decode_pixels(vae, z)
+        gt = decode_pixels(vae, task["query_out"])
+        assert not last_frame_mismatch(pred, gt)
+
+
+def test_encode_task_no_cue_leaves_query_vel_none(vae):
+    task = encode_task(vae, sample_task("translate", seed=0))
+    assert task["query_vel"] is None
+
+
 def test_composite_pan_holds_sprite_scrolls_bg():
     still = torch.zeros(1, 24, 7, 8, 8)
     still[:, 0, :, :, :] = 0.1  # textured bg

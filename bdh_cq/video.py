@@ -304,8 +304,15 @@ def encode_task(
     vae: nn.Module,
     task: dict[str, Any],
     device: torch.device | str | None = None,
+    query_cue_frames: int = 0,
 ) -> dict[str, Any]:
-    """Oracle task -> VAE posterior means. Inputs are still-clips of frame 0."""
+    """Oracle task -> VAE posterior means.
+
+    `query_cue_frames=0`: the query cue is a still-clip of frame 0 (paper split).
+    `query_cue_frames=K>0`: the cue is the real query clip run for K frames then
+    frozen, so its velocity is observable — the fix for speed-carrying families
+    (`translate` / `pan`) whose difficulty level is invisible in one frame.
+    """
 
     def encode_still(first_frame: np.ndarray) -> Tensor:
         video = pixel_to_ncthw(first_frame)
@@ -325,8 +332,20 @@ def encode_task(
         demo_out.append(encode_clip(clip))
 
     _level, query_first, query_clip = task["test"][0]
-    query_in = encode_still(query_first)
     query_out = encode_clip(query_clip)
+    query_vel = None
+    if query_cue_frames and 2 <= query_cue_frames < len(query_clip):
+        k = int(query_cue_frames)
+        cue = np.concatenate(
+            [query_clip[:k], np.repeat(query_clip[k - 1 : k], len(query_clip) - k, axis=0)]
+        )
+        query_in = encode_clip(cue)
+        cents = energy_centroid(query_in)  # (B, T', 2)
+        # latent time that still holds real motion (temporal compression ~3x)
+        k_lat = max(1, round((k / len(query_clip)) * (query_in.shape[2] - 1)))
+        query_vel = ((cents[:, k_lat] - cents[:, 0]) / k_lat).to(query_out.dtype)
+    else:
+        query_in = encode_still(query_first)
     # Latent-grid dest, not pixel centroid / spatial. Pixel 7.875 overshoots
     # FakeVAE last-time energy (~7.42) and trips motL1 while lastL1 is fine.
     src = energy_centroid(query_in)[:, 0]
@@ -339,6 +358,7 @@ def encode_task(
         query_in=query_in,
         query_out=query_out,
         query_shift=query_shift,
+        query_vel=query_vel,
     )
 
 
@@ -675,6 +695,7 @@ class BDHVideoReasoningWrapper(Module):
         canvas_update_memory: bool = True,
         motion_rank: int = 0,
         decode: str = "shift",
+        warp_spatial: int = 8,
     ):
         super().__init__()
         if decode not in ("shift", "copy", "pan"):
@@ -709,7 +730,9 @@ class BDHVideoReasoningWrapper(Module):
         # 0 = residual volume. k>0 = IMF rank-k. k<0 = 2D shift of the still.
         self.motion_rank = int(motion_rank)
         if self.motion_rank <= 0:
-            self.warp_spatial = 8
+            # pixel-resolution of the composite/warp: FakeVAE sprite path is 8,
+            # the real H3 latent is VAE_SPATIAL (16) — finer warp = less blur.
+            self.warp_spatial = int(warp_spatial)
         if self.motion_rank == 0:
             self.to_centroid = nn.Linear(bdh.dim, 2)
             nn.init.zeros_(self.to_centroid.weight)
@@ -865,6 +888,18 @@ class BDHVideoReasoningWrapper(Module):
                 for z_in, z_out in zip(demo_in, demo_out)
             ]
             self._demo_shift = torch.stack(deltas, dim=0).mean(dim=0).detach()
+        # 2-frame cue: velocity is measured from the query prefix and
+        # extrapolated to the last latent time — the level (speed) the demos
+        # cannot carry. Overrides the demo-average magnitude when present.
+        self._query_shift_from_vel = None
+        qv = task_latents.get("query_vel")
+        if self.motion_rank == 0 and self.decode in ("shift", "pan") and qv is not None:
+            self._query_shift_from_vel = (qv * (self.latent_t - 1)).detach()
+            # The cue moved for K frames then froze; that motion was only for
+            # measuring velocity. composite_shift / lock_t0 need a *static*
+            # still, so collapse to latent time 0.
+            self._query_still = still[:, :, :1].expand_as(still).contiguous()
+            self._source_yx = energy_centroid(self._query_still)[:, 0].detach()
         # copy mode: salient cells of the query still are the occupancy prior
         # (stamp anchors are gray markers, recolor target is the sprite blob).
         self._occ_prior = None
@@ -912,6 +947,13 @@ class BDHVideoReasoningWrapper(Module):
 
     def _shift_from_hidden(self, hidden: Tensor) -> Tensor:
         corr = self.to_centroid(hidden.mean(dim=1))
+        vel = getattr(self, "_query_shift_from_vel", None)
+        if vel is not None:
+            vel = vel.to(device=hidden.device, dtype=hidden.dtype)
+            if vel.shape[0] != hidden.shape[0]:
+                vel = vel.expand(hidden.shape[0], 2)
+            # measured velocity is the magnitude+direction; head only corrects
+            return vel + corr
         demo = getattr(self, "_demo_shift", None)
         if demo is None:
             return corr
@@ -1116,6 +1158,10 @@ class BDHVideoReasoningWrapper(Module):
             raise ValueError(
                 f"reason() requires embeds.shape[-2]=={cells}, got {tuple(hidden.shape)}"
             )
+        # With a 2-frame cue the passed still moves then freezes; the decode
+        # heads want the static frame-0 volume (ingest_task collapsed it).
+        if getattr(self, "_query_shift_from_vel", None) is not None and still is not None:
+            still = self._query_still
 
         all_block_outputs = [hidden]
         hiddens = [hidden]

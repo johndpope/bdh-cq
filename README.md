@@ -66,19 +66,16 @@ The synthetic sprite oracles (`bdh_cq/video_tasks.py`) are the CPU-testable
 sanity for "can ICQ bind a demo rule into `S` and apply it to a new query".
 Each `BDHVideoReasoningWrapper` decode mode is auto-routed by family
 (`--decode {shift,copy,pan}`). Clips below are **held-out** (a task family
-seen in the demos, a fresh unseen instance at query time); **left = model
-prediction, right = ground truth**, FakeVAE round-trip, ~804k-param `protocol`
-model on CPU.
-
-Each clip is **left = model prediction, right = ground truth**, 22 frames at
-128², shown 3× and looped.
+seen in the demos, a fresh unseen instance at query time): **left = model
+prediction, right = ground truth**, 22 frames at 128², FakeVAE round-trip,
+~804k-param `protocol` model on CPU, shown 3× and looped.
 
 | family | decode | held-out |
 |---|---|---|
 | `identity` | `copy` | ✅ `lastL1` 0.002 |
 | `stamp_copy` | `copy` (attention-copy) | ✅ `lastL1` 0.016 |
-| `recolor` | `copy` | ✅ `lastL1` 0.020 (soft gate) |
-| `translate` | `shift` | direction exact, magnitude short |
+| `recolor` | `copy` | ✅ `lastL1` 0.020 (soft gate — see handoff doc) |
+| `translate` | `shift` + `--query_cue_frames 9` | ✅ `lastL1` 0.023 |
 
 <table>
 <tr>
@@ -87,13 +84,18 @@ Each clip is **left = model prediction, right = ground truth**, 22 frames at
 </tr>
 <tr>
 <td align="center"><b>recolor</b><br><img src="docs/media/sprite_recolor_heldout.gif" width="320"></td>
-<td align="center"><b>translate</b> — held-out, direction learned<br><img src="docs/media/sprite_translate_heldout.gif" width="320"></td>
+<td align="center"><b>translate</b><br><img src="docs/media/sprite_translate_cue_heldout.gif" width="320"></td>
 </tr>
 </table>
 
-`translate` overfit reference (train query, tight fit):
+`translate` without the query cue (direction learned, magnitude short — the
+query's speed is not observable in one still frame) and the overfit train-query
+reference:
 
-<p align="center"><img src="docs/media/sprite_translate_overfit.gif" width="360"></p>
+<p align="center">
+<img src="docs/media/sprite_translate_heldout.gif" width="300">
+<img src="docs/media/sprite_translate_overfit.gif" width="300">
+</p>
 
 The source `.mp4`s (and per-step evals) are in each `logs/recon_*/` run
 directory; `docs/media/` keeps the standout ones.
@@ -108,11 +110,12 @@ uv run python train_video_icq.py --family stamp_copy --vae fake --device cpu \
 # -> logs/recon_stamp_copy/heldout.mp4  (left = pred, right = GT)
 ```
 
-Not yet passing: `translate` magnitude (the query's difficulty level, i.e.
-speed, is not observable in a single still frame) and `pan` / `translate_pan`
-(the FakeVAE latent bilinear warp floors at `lastL1` ~0.04–0.10 vs the 8/255
-gate even with the true motion vector — a decode-fidelity ceiling, not a
-reasoning one). See the handoff doc for the analysis.
+Not yet passing: `pan` / `translate_pan` — the FakeVAE latent bilinear warp
+floors at `lastL1` ~0.04–0.10 vs the 8/255 gate even with the true motion
+vector, a decode-fidelity ceiling rather than a reasoning one. The fix is the
+real H3 VAE, which needs a CUDA host; the decode ops (`composite_pan`,
+`composite_translate_pan`) are already written and oracle-tested. See the
+handoff doc for the analysis and the exact run command.
 
 ## Citations
 
