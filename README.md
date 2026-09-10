@@ -52,6 +52,61 @@ loss.backward()
 answer = wrapper.generate(prompts, 8, num_tokens = 32, stop_token = 0)
 ```
 
+## Video extension (research)
+
+An in-repo experiment reframes video generation as the same **ingest → relax →
+render** protocol: a shot is an ARC-style task whose "grid" is a frozen-VAE
+latent volume, demos write the shot grammar into `S`, the query still frame
+seeds `H_0`, and a learned decode head reads the answer volume out. Everything
+here is research scaffolding — `pip install bdh-cq` still ships only the
+`bdh_cq/` package. Design of record: [`docs/BDH_CQ_VIDEO_PLAN.md`](docs/BDH_CQ_VIDEO_PLAN.md),
+handoff + per-family status: [`docs/HANDOFF_SPRITE_ICQ.md`](docs/HANDOFF_SPRITE_ICQ.md).
+
+The synthetic sprite oracles (`bdh_cq/video_tasks.py`) are the CPU-testable
+sanity for "can ICQ bind a demo rule into `S` and apply it to a new query".
+Each `BDHVideoReasoningWrapper` decode mode is auto-routed by family
+(`--decode {shift,copy,pan}`). Clips below are **held-out** (a task family
+seen in the demos, a fresh unseen instance at query time); **left = model
+prediction, right = ground truth**, FakeVAE round-trip, ~804k-param `protocol`
+model on CPU.
+
+| family | decode | held-out | clip |
+|---|---|---|---|
+| `identity` | `copy` | ✅ `lastL1` 0.002 | [identity](docs/media/sprite_identity_heldout.mp4) |
+| `stamp_copy` | `copy` (attention-copy) | ✅ `lastL1` 0.016 | [stamp_copy](docs/media/sprite_stamp_copy_heldout.mp4) |
+| `recolor` | `copy` | ✅ `lastL1` 0.020 (soft gate) | [recolor](docs/media/sprite_recolor_heldout.mp4) |
+| `translate` | `shift` | direction exact, magnitude short | [translate held-out](docs/media/sprite_translate_heldout.mp4) · [overfit ref](docs/media/sprite_translate_overfit.mp4) |
+
+<table>
+<tr>
+<td align="center"><b>identity</b><br><video src="https://github.com/johndpope/bdh-cq/raw/docs/handoff-sprite-icq-fixes/docs/media/sprite_identity_heldout.mp4" width="240" controls loop muted></video></td>
+<td align="center"><b>stamp_copy</b><br><video src="https://github.com/johndpope/bdh-cq/raw/docs/handoff-sprite-icq-fixes/docs/media/sprite_stamp_copy_heldout.mp4" width="240" controls loop muted></video></td>
+</tr>
+<tr>
+<td align="center"><b>recolor</b><br><video src="https://github.com/johndpope/bdh-cq/raw/docs/handoff-sprite-icq-fixes/docs/media/sprite_recolor_heldout.mp4" width="240" controls loop muted></video></td>
+<td align="center"><b>translate</b> (held-out; direction learned)<br><video src="https://github.com/johndpope/bdh-cq/raw/docs/handoff-sprite-icq-fixes/docs/media/sprite_translate_heldout.mp4" width="240" controls loop muted></video></td>
+</tr>
+</table>
+
+> If the players do not load (older markdown renderers), the table links above
+> download the same `.mp4`s from `docs/media/`.
+
+Reproduce (a few seconds each on CPU):
+
+```bash
+uv run pytest tests/test_video_icq.py tests/test_video_tasks.py   # ~90 checks, FakeVAE, no MiniMax-H3
+uv run python train_video_icq.py --family stamp_copy --vae fake --device cpu \
+  --scale protocol --overfit False --steps 120 --wandb False \
+  --recon_dir logs/recon_stamp_copy
+# -> logs/recon_stamp_copy/heldout.mp4  (left = pred, right = GT)
+```
+
+Not yet passing: `translate` magnitude (the query's difficulty level, i.e.
+speed, is not observable in a single still frame) and `pan` / `translate_pan`
+(the FakeVAE latent bilinear warp floors at `lastL1` ~0.04–0.10 vs the 8/255
+gate even with the true motion vector — a decode-fidelity ceiling, not a
+reasoning one). See the handoff doc for the analysis.
+
 ## Citations
 
 ```bibtex
