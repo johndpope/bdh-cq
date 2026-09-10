@@ -23,6 +23,7 @@ from bdh_cq.video_probes import (
     OCC_FRAC,
     admit_clip,
     energy_centroid,
+    energy_map,
     gaussian_occupancy_logits,
     last_frame_appearance_mse,
     last_frame_energy_kl,
@@ -215,6 +216,56 @@ def composite_shift(
     fill = (bg_only.flatten(-2).sum(dim=-1) / denom).view(*still.shape[:3], 1, 1)
     punched = torch.where(src_gate.bool(), fill.expand_as(still), still)
     return punched * (1.0 - moved_gate) + moved
+
+
+def composite_pan(
+    still: Tensor,
+    pan_yx: Tensor,
+    spatial: int = 8,
+    occ_frac: float = OCC_FRAC,
+) -> Tensor:
+    """Scroll the background under a screen-static sprite (pan family).
+
+    Inverse of composite_shift: warp the whole still by pan_yx, then paste the
+    *original* sprite back at its screen position so only the bg moves. t=0 is
+    identity (warp_still lerps alpha=0..1). Grad flows through grid_sample.
+    """
+    if still.ndim != 5 or pan_yx.ndim != 2 or pan_yx.shape[-1] != 2:
+        raise ValueError(
+            f"expected still (B,C,T,H,W) and pan (B,2), got "
+            f"{tuple(still.shape)} {tuple(pan_yx.shape)}"
+        )
+    energy = still[:, :, :1].pow(2).mean(dim=1, keepdim=True)
+    peak = energy.flatten(2).amax(dim=-1).clamp_min(1e-8).view(-1, 1, 1, 1, 1)
+    src_gate = (energy >= occ_frac * peak).to(dtype=still.dtype)
+    warped = warp_still(still, pan_yx, spatial=spatial)
+    return warped * (1.0 - src_gate) + still * src_gate
+
+
+def composite_translate_pan(
+    still: Tensor,
+    shift_yx: Tensor,
+    pan_yx: Tensor,
+    spatial: int = 8,
+    occ_frac: float = OCC_FRAC,
+) -> Tensor:
+    """translate_pan cliff: sprite moves by shift_yx, bg scrolls by pan_yx.
+
+    Warp the bg by pan, warp the punched sprite by shift, recombine on the
+    moved-sprite gate. composite_shift's static-mean fill is replaced by the
+    panned bg.
+    """
+    if shift_yx.shape[-1] != 2 or pan_yx.shape[-1] != 2:
+        raise ValueError(f"shift/pan must be (B,2), got {tuple(shift_yx.shape)} {tuple(pan_yx.shape)}")
+    energy = still[:, :, :1].pow(2).mean(dim=1, keepdim=True)
+    peak = energy.flatten(2).amax(dim=-1).clamp_min(1e-8).view(-1, 1, 1, 1, 1)
+    src_gate = (energy >= occ_frac * peak).to(dtype=still.dtype)
+    t_len = still.shape[2]
+    gate_vol = src_gate.expand(-1, 1, t_len, -1, -1)
+    moved_gate = warp_still(gate_vol, shift_yx, spatial=spatial).clamp(0, 1)
+    moved_sprite = warp_still(still * src_gate, shift_yx, spatial=spatial)
+    panned_bg = warp_still(still * (1.0 - src_gate), pan_yx, spatial=spatial)
+    return panned_bg * (1.0 - moved_gate) + moved_sprite
 
 
 def apply_residual(u: Tensor, still: Tensor) -> Tensor:
@@ -623,8 +674,17 @@ class BDHVideoReasoningWrapper(Module):
         to_latent: nn.Linear | None = None,
         canvas_update_memory: bool = True,
         motion_rank: int = 0,
+        decode: str = "shift",
     ):
         super().__init__()
+        if decode not in ("shift", "copy", "pan"):
+            raise ValueError(f"decode must be shift|copy|pan, got {decode!r}")
+        # shift: composite the query still by a demo-derived sprite (dy, dx).
+        # copy: still-broadcast + gated appearance residual, no translation
+        # (identity / stamp_copy / recolor). pan: scroll the bg under a
+        # screen-static sprite, both a sprite shift and a bg pan vector from
+        # the demos (pan / translate_pan).
+        self.decode = decode
         self.bdh = bdh
         self.patch_in = nn.Linear(LATENT_CH, bdh.dim)
         if to_latent is None:
@@ -663,7 +723,21 @@ class BDHVideoReasoningWrapper(Module):
             with torch.no_grad():
                 self.demo_to_shift.weight.copy_(2.0 * torch.eye(2))
                 self.demo_to_shift.bias.zero_()
+            # A per-task multiplicative gain head on top of demo_to_shift was
+            # tried (feat = [source_yx, demo_shift, hidden.mean]) and made
+            # training unstable (shift_mse 2 -> 80): the demo->query ratio
+            # varies 1.8-4.0x with the query *level*, which a still frame does
+            # not show, so there is nothing stable for it to fit. Direction is
+            # exact from demo_to_shift; magnitude is left at the ~2.3x mean.
             self.log_occ_sigma = nn.Parameter(torch.zeros(()))
+        if self.motion_rank == 0 and self.decode == "copy":
+            # The answer cells for a still-frame edit (stamp anchors, recolor
+            # sprite) are the salient cells of the query still. Per-cell
+            # to_occupancy on prefix-sum H stays near-uniform (occCE stuck at
+            # log(H*W)); this bias makes the still's own support a strong
+            # occupancy prior, the copy-mode analog of the shift path's
+            # Gaussian-at-centroid. Learned scale, init 3.0.
+            self.occ_prior_scale = nn.Parameter(torch.tensor(3.0))
         if self.motion_rank < 0:
             self.to_shift = nn.Linear(bdh.dim, 2)
             nn.init.zeros_(self.to_shift.weight)
@@ -785,12 +859,19 @@ class BDHVideoReasoningWrapper(Module):
         # from the reasoned hidden. Direction/axis is right; the query is a
         # higher level than the demos, so demo_to_shift learns the scale.
         self._demo_shift = None
-        if self.motion_rank == 0 and demo_in:
+        if self.motion_rank == 0 and self.decode in ("shift", "pan") and demo_in:
             deltas = [
                 energy_centroid(z_out)[:, -1] - energy_centroid(z_in)[:, 0]
                 for z_in, z_out in zip(demo_in, demo_out)
             ]
             self._demo_shift = torch.stack(deltas, dim=0).mean(dim=0).detach()
+        # copy mode: salient cells of the query still are the occupancy prior
+        # (stamp anchors are gray markers, recolor target is the sprite blob).
+        self._occ_prior = None
+        if self.motion_rank == 0 and self.decode == "copy":
+            energy = energy_map(still)
+            peak = energy.flatten(2).amax(dim=-1).clamp_min(1e-8)[..., None, None]
+            self._occ_prior = (energy >= OCC_FRAC * peak).to(still.dtype).detach()
         return Memory(memories.tokens_seen, embeds, memories.fast_weight_memories)
 
     def _occ_sigma(self) -> Tensor:
@@ -838,6 +919,24 @@ class BDHVideoReasoningWrapper(Module):
         )
         return shift, residual + gauss[:, None]
 
+    def _copy_logits(self, hidden: Tensor) -> Tensor:
+        """(B, N, dim) -> (B, 1, T, H, W) occupancy logits for copy mode:
+        per-cell to_occupancy plus the query still's support as a strong prior."""
+        logits = rearrange(
+            self.to_occupancy(hidden),
+            "b (t h w) 1 -> b 1 t h w",
+            t=self.latent_t,
+            h=self.latent_h,
+            w=self.latent_w,
+        )
+        prior = getattr(self, "_occ_prior", None)
+        if prior is not None:
+            prior = prior.to(device=hidden.device, dtype=hidden.dtype)
+            if prior.shape[0] != hidden.shape[0]:
+                prior = prior.expand(hidden.shape[0], *prior.shape[1:])
+            logits = logits + self.occ_prior_scale * (2.0 * prior[:, None] - 1.0)
+        return logits
+
     def to_latent_volume(self, hidden: Tensor) -> Tensor:
         if self.latent_h is None or self.latent_w is None:
             raise RuntimeError("ingest_task must run before to_latent_volume")
@@ -845,6 +944,29 @@ class BDHVideoReasoningWrapper(Module):
             raise ValueError(f"expected {self.n_cells} cells, got {hidden.shape[-2]}")
         if self.motion_rank < 0:
             raise RuntimeError("shift head warps the still in reason(); not to_latent_volume")
+        if self.motion_rank <= 0 and self.decode == "copy":
+            # Still broadcast over T plus a gated appearance residual. Occupancy
+            # is per-cell to_occupancy biased by the query still's own support
+            # (_copy_logits) — the per-cell Linear alone stays near-uniform.
+            appearance = self.to_latent(hidden)
+            logits = self._copy_logits(hidden)
+            gate = rearrange(
+                spatial_softmax_gate(logits[:, 0]), "b t h w -> b (t h w) 1"
+            )
+            residual = rearrange(
+                appearance * gate,
+                "b (t h w) c -> b c t h w",
+                t=self.latent_t,
+                h=self.latent_h,
+                w=self.latent_w,
+            )
+            self._last_residual = residual
+            still = self._query_still
+            if still is None:
+                return residual
+            still = still.to(device=hidden.device, dtype=hidden.dtype)
+            base = still[:, :, :1].expand(-1, -1, self.latent_t, -1, -1)
+            return base + residual
         if self.motion_rank <= 0:
             appearance = self.to_latent(hidden)
             shift, logits = self._occupancy_from_hidden(hidden)
@@ -875,6 +997,8 @@ class BDHVideoReasoningWrapper(Module):
             raise RuntimeError("ingest_task must run before occupancy_logits")
         if hidden.shape[-2] != self.n_cells:
             raise ValueError(f"expected {self.n_cells} cells, got {hidden.shape[-2]}")
+        if self.decode == "copy":
+            return self._copy_logits(hidden)
         return self._occupancy_from_hidden(hidden)[1]
 
     def shift_token(self, hidden: Tensor) -> Tensor:
@@ -978,6 +1102,19 @@ class BDHVideoReasoningWrapper(Module):
                 composite_shift(still, self.shift_token(h), spatial=self.warp_spatial)
                 for h in hiddens
             ]
+        elif self.decode == "pan":
+            if still is None:
+                raise RuntimeError("pan decode needs the query still")
+            # pan family: the whole scene translates together (sprite screen
+            # pos = world - camera, both shift), so a full-frame warp is the
+            # right decode. composite_translate_pan stays available for a
+            # sprite/bg split but is not wired here (see docs: the FakeVAE
+            # latent warp floors ~36-100/255 on a pan clip even with the
+            # oracle vector — pan is decode-fidelity-bound, not ICL-bound).
+            volumes = [
+                warp_still(still, self._shift_from_hidden(h), spatial=self.warp_spatial)
+                for h in hiddens
+            ]
         else:
             volumes = [self.to_latent_volume(h) for h in hiddens]
             if still is not None:
@@ -1046,13 +1183,17 @@ class BDHVideoReasoningWrapper(Module):
                 if residual is not None
                 else z_last.new_zeros(())
             )
+            # shift mode: the residual is a nuisance next to composite_shift,
+            # keep it near zero. copy mode: the residual *is* the stamp/recolor
+            # edit, so an L2-to-zero would suppress the answer.
+            res_pen = z_last.new_zeros(()) if self.decode == "copy" else res_l2
             loss = (
                 recs.mean()
                 + lambda_dt * dts.mean()
                 + lambda_last * (apps + lasts + mots)
                 + lambda_energy * (ces + kls + dices)
                 + lambda_mass * (masses + fps)
-                + res_l2
+                + res_pen
             )
             parts_res = float(res_l2.detach())
         else:
@@ -1075,7 +1216,7 @@ class BDHVideoReasoningWrapper(Module):
             fp_energy=float(fps.detach()),
             residual_l2=parts_res,
         )
-        if self.motion_rank <= 0 and (
+        if self.decode != "copy" and self.motion_rank <= 0 and (
             self.motion_rank < 0 or hasattr(self, "to_centroid")
         ):
             if self.motion_rank < 0:

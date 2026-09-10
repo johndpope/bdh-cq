@@ -231,6 +231,7 @@ def run(
     sprite_mix: float = 0.25,
     canvas_write_s: bool = True,
     motion_rank: int = 0,
+    decode: str = "auto",
     query_id: str = "id_d",
     transfer_action: str = "laugh",
     heldout_query_id: str = "id_c",
@@ -321,6 +322,20 @@ def run(
         # Demos write S; query still is H_0 only.
         canvas_write_s = False
 
+    # copy: the answer edits the still in place (no rigid motion) so the
+    # demo displacement is meaningless. shift: composite the still by (dy, dx).
+    COPY_FAMILIES = {"identity", "stamp_copy", "recolor"}
+    PAN_FAMILIES = {"pan", "translate_pan"}
+    if decode == "auto":
+        if family in COPY_FAMILIES:
+            decode = "copy"
+        elif family in PAN_FAMILIES:
+            decode = "pan"
+        else:
+            decode = "shift"
+    if decode not in ("shift", "copy", "pan"):
+        raise ValueError(f"--decode must be auto|shift|copy|pan, got {decode!r}")
+
     device_t = torch.device(device)
     fake_spatial = 8 if family in VIDEO_TASKS else 16
     vae_mod = _load_vae(vae, device_t, seed, spatial=fake_spatial)
@@ -389,6 +404,7 @@ def run(
         make_video_model(scale=scale),
         canvas_update_memory=canvas_write_s,
         motion_rank=motion_rank,
+        decode=decode,
     ).to(device_t)
     use_amp = bool(amp) if amp is not None else (
         device_t.type == "cuda" and scale == "billion"
@@ -405,6 +421,7 @@ def run(
                 "to_occupancy",
                 "to_centroid",
                 "demo_to_shift",
+                "occ_prior_scale",
                 "log_occ_sigma",
             )
         ):
@@ -455,6 +472,7 @@ def run(
         sprite_mix=sprite_mix,
         canvas_write_s=canvas_write_s,
         motion_rank=motion_rank,
+        decode=decode,
         query_id=query_id,
         transfer_action=transfer_action,
         heldout_query_id=heldout_query_id,
@@ -510,7 +528,7 @@ def run(
     print(
         f"poc family={family} scale={scale} steps={steps} overfit={overfit} "
         f"vae={vae} canvas={height}x{width} device={device_t} params={n_params:,} "
-        f"canvas_write_s={canvas_write_s} motion_rank={motion_rank} "
+        f"canvas_write_s={canvas_write_s} motion_rank={motion_rank} decode={decode} "
         f"lambda_m={lambda_m} lambda_ctx={lambda_ctx} peak_power={peak_power} "
         f"lambda_last={lambda_last} lambda_energy={lambda_energy} "
         f"lambda_mass={lambda_mass}",
@@ -621,7 +639,9 @@ def run(
                 gt_l1 = pixel_temporal_l1(gt_pix)
                 pred_end = pixel_t0_t21_l1(pred_pix)
                 gt_end = pixel_t0_t21_l1(gt_pix)
-                still_fail = is_still_clip(pred_pix)
+                # A still pred is only a failure when the GT actually moves;
+                # identity / stamp_copy / recolor GT is a still by design.
+                still_fail = is_still_clip(pred_pix) and not is_still_clip(gt_pix)
                 last_l1 = pixel_last_frame_l1(pred_pix, gt_pix)
                 last_mot = pixel_last_frame_motion_l1(pred_pix, gt_pix)
                 last_fail = last_frame_mismatch(pred_pix, gt_pix)
@@ -751,7 +771,7 @@ def run(
         pred_pix = decode_pixels(vae_mod, held_m["z_hat"])
         gt_pix = decode_pixels(vae_mod, held["query_out"])
         pred_l1 = pixel_temporal_l1(pred_pix)
-        still_fail = is_still_clip(pred_pix)
+        still_fail = is_still_clip(pred_pix) and not is_still_clip(gt_pix)
         last_l1 = pixel_last_frame_l1(pred_pix, gt_pix)
         last_mot = pixel_last_frame_motion_l1(pred_pix, gt_pix)
         last_fail = last_frame_mismatch(pred_pix, gt_pix)

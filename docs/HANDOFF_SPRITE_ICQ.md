@@ -1,6 +1,6 @@
 # Handoff: BDH-CQ video ICQ (sprites + talking heads)
 
-**Status:** Sprite **train-query last frame passed**. Sprite **held-out failed**. Talking-head last frame **never passed** (idle/smear vs laugh). 1B on msi **ran and still failed** last frame. GPU is idle.
+**Status:** Sprite **train-query last frame passed**. Held-out: **`identity` passes** (2026-09-10, `decode=copy`); `translate` direction is exact but magnitude is capped by the unobservable query level; `stamp_copy` / `pan` / `translate_pan` / `recolor` still fail (see "Held-out generalization" below — each is a specific decode gap, not a config). Talking-head last frame **never passed** (idle/smear vs laugh). 1B on msi **ran and still failed** last frame. GPU is idle.
 
 **Product pass is visual, not pytest.** A still, a gray wash, a flood, or a closed mouth next to GT teeth is a fail even if CLIP_FAIL is clear, tL1 looks fine, or PSNR is ~16–28.
 
@@ -89,6 +89,70 @@ These are why “tests passed” and “loss 0.005, PSNR 16” were not a film-o
 
 ---
 
+## Held-out generalization (2026-09-10 pass): decode modes per family
+
+`--overfit False` now trains a fresh task each step; the trainer's end-of-run
+held-out eval (`seed + 10_000`) is the gate. `BDHVideoReasoningWrapper` takes
+`decode={shift,copy,pan}`, auto-routed by family in `train_video_icq.py`
+(`--decode` to override).
+
+**`shift`** (`translate`) — composite the query still by a demo-derived
+`(dy, dx)`. A probe (120 random tasks, untrained protocol) showed the query
+displacement is **not** linearly decodable from `hidden.mean` (held-out R²
+−0.4 / −48) but the **demo-average energy-centroid delta** gives R² 0.91 / 0.93.
+So `ingest_task` stashes `_demo_shift` and `_shift_from_hidden` is
+`demo_to_shift(_demo_shift) + to_centroid(hidden.mean)`, `demo_to_shift` a
+`Linear(2,2)` init `2·I`. Result: **direction exact on every task**; last-frame
+gate passes ~5/9 random tasks and misses the held-out seed by magnitude.
+A per-task gain head (`feat = [source_yx, _demo_shift, hidden.mean]`) was tried
+and **destabilised training** (`shift_mse` 2 → 80) — the demo→query ratio
+varies 1.8–4.0× with the query *level*, and **a still frame does not show
+level (= speed)**. `translate` last-frame exact-match held-out has an
+information ceiling; the fixes are overlapping `test_levels`/`demo_levels` or a
+2-frame query, both change the family.
+
+**`copy`** (`identity`, `stamp_copy`, `recolor`) — no rigid motion; the answer
+edits the still in place. Decode is `still_broadcast + spatial_softmax_gate(
+to_occupancy + occ_prior) · to_latent(hidden)`, `lock_t0` for `t=0`. `occ_prior`
+= the query still's own support (`energy ≥ OCC_FRAC·peak`), a strong prior
+because stamp anchors / the recolor sprite are already salient in `H_0` (the
+per-cell `to_occupancy` alone stays near-uniform, same failure as `shift`
+occupancy). `res_l2` is dropped for copy mode — there the residual *is* the
+answer.
+  - `identity` — **solved** (trainer EXIT 0): held-out `mse 0.0000`,
+    `identity_probe True`, `lastL1 0.002`. Zero-init `to_latent` returns
+    `still_broadcast`, which *is* the identity answer, so it starts near-perfect.
+  - `stamp_copy` — **still fails** (held-out `lastL1 0.10`, `mse` flat at 0.003
+    over 240 steps). The occ_prior localizes the anchor cells correctly, but
+    the *appearance* at an anchor has to be **the source sprite's pixels copied
+    there** — a src→anchor gather the per-cell `to_latent(hidden)` cannot do.
+    Needs an attention-copy decode (`out[anchor] = still[src]`), not a per-cell
+    regression. This is the real remaining work for the copy path.
+  - `recolor` — copy mode runs, but a color swap over ~6% of pixels is a
+    sub-gate mean-L1 change; the last-frame gate can't score it. Needs
+    `recolor_probe` (already in `video_probes.py`) wired into the gate.
+
+**`pan`** (`pan`, `translate_pan`) — `composite_pan` / `composite_translate_pan`
+are implemented and oracle-tested; `decode="pan"` uses full-frame `warp_still`
+by the scene-centroid shift (the whole scene translates together for `pan`).
+**Blocked, and it is a decode-fidelity ceiling, not reasoning:** the oracle
+full-frame warp of the FakeVAE latent on a `pan` clip floors at **lastL1
+0.036–0.10** vs the 0.031 gate, *with the true vector*. Bilinear warp of a
+16×16 latent + the checker edges + the gradient blur. `translate_pan` also
+can't separate sprite motion from the periodic checker in the centroid. Needs
+the real H3 VAE (its latent may warp cleanly) or a non-warp decode.
+
+### Gate fixes for the still families
+
+- `is_still_clip(pred)` is only a `CLIP_FAIL` when GT actually moves —
+  `still_fail = is_still_clip(pred) and not is_still_clip(gt)` in the trainer.
+- `last_frame_mismatch` skips the `motL1` fallback when GT has no motion to
+  weight by (`pixel_t0_t21_l1(target) < STILL_L1`). The 8/255 L1 gate is **not**
+  relaxed for still GT — a converged `identity` roundtrips well under it, and
+  `stamp_copy`/`recolor` must actually apply the edit.
+
+---
+
 ## Talking heads (msi) — not a pass
 
 Query: `icq_transfer` id_d **laugh**, demos other ids, 512×288, H3 VAE, R≤2, protocol ~0.8–1.0M.
@@ -124,10 +188,25 @@ More parameters did not open the mouth. Sprite pass was a head change, not scale
 
 ## Suggested next work (in order)
 
-1. **Sprite generalization** — held-out translate without memorizing dest. Keep `composite_shift`; vary seeds; maybe condition (dy,dx) on demos not a single overfit vector.
-2. **Talking-head decode** analogous to `composite_shift`: keep identity from H_0, generate only expression residual that can make **teeth**. Rank-k / IMTalker / 1B Linear volume all failed that.
-3. Do not loosen last-frame to pass a closed mouth. `motL1` on the face, or a mouth crop, is the talking-head gate.
-4. MSI: `johndpope@msi.local`, VAE `/run/media/johndpope/2TB/minimax-h3-nvfp4/vae/minimax_h3_video_vae_fp16.safetensors`, H3 `/home/johndpope/Documents/GitHub/MiniMax-H3`. Transfer latents `data/icq_transfer/latents_h3_512x288_f22_transfer.pt`.
+1. **`stamp_copy` src→anchor gather** — `decode=copy` + occ_prior gets the
+   anchor *locations*; the anchor *appearance* must be the source sprite copied
+   there. Add an attention-copy head (`out[anchor] ← still[src]`) instead of
+   per-cell `to_latent`. Determined task, clean gate — the best next win.
+2. **`translate` magnitude** — either accept the ceiling (direction exact,
+   ~half of held-out passes) or change the family: overlap `test_levels` with
+   `demo_levels`, or feed a 2-frame query so speed is visible. A per-task gain
+   head does not work — level is not in a still frame.
+3. **`pan` on the real H3 VAE** — the FakeVAE-latent warp ceiling (oracle
+   lastL1 0.036–0.10) may not exist on the H3 latent. `composite_pan` /
+   `composite_translate_pan` are ready.
+4. **`recolor` gate** — wire `recolor_probe` into `last_frame_mismatch`; mean
+   pixel L1 cannot score a fill A→B swap over ~6% of the frame.
+5. **Talking-head decode** analogous to the copy path: keep identity from H_0,
+   generate only an expression residual that can make **teeth**. Rank-k /
+   IMTalker / 1B Linear volume all failed that.
+6. Do not loosen last-frame to pass a closed mouth. `motL1` on the face, or a
+   mouth crop, is the talking-head gate.
+7. MSI: `johndpope@msi.local`, VAE `/run/media/johndpope/2TB/minimax-h3-nvfp4/vae/minimax_h3_video_vae_fp16.safetensors`, H3 `/home/johndpope/Documents/GitHub/MiniMax-H3`. Transfer latents `data/icq_transfer/latents_h3_512x288_f22_transfer.pt`.
 
 ---
 
@@ -142,7 +221,11 @@ More parameters did not open the mouth. Sprite pass was a head change, not scale
 | Earlier shift-head pass | `logs/recon_sprite_shift/step_00199.mp4` |
 | Laugh fail t=21 | `logs/recon_imtalker_transfer/_preview/t21.jpg` |
 | 1B fail pair | `logs/recon_billion/step_00039.mp4` |
-| Composite head | `bdh_cq/video.py` (`composite_shift`, `warp_still`) |
+| Composite / decode heads | `bdh_cq/video.py` (`composite_shift`, `composite_pan`, `composite_translate_pan`, `warp_still`, `_copy_logits`, `_shift_from_hidden`) |
+| Decode-mode routing | `train_video_icq.py` (`--decode auto|shift|copy|pan`, `COPY_FAMILIES` / `PAN_FAMILIES`) |
 | Last-frame gate | `bdh_cq/video_probes.py` |
 | Trainer | `train_video_icq.py` |
 | Sprite oracle | `bdh_cq/video_tasks.py` (`SPRITE_SIZE=32`, `BG_LO/HI`, `SPRITE_LO/HI`) |
+| identity held-out pass | `logs/recon_id_v2/heldout.mp4` |
+| stamp_copy held-out fail | `logs/recon_sc_v2/heldout.mp4` |
+| translate held-out (direction ok, magnitude off) | `logs/recon_sprite_gen/heldout.mp4` |

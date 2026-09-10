@@ -19,7 +19,9 @@ from bdh_cq.video import (
     PAD,
     BDHVideoReasoningWrapper,
     apply_residual,
+    composite_pan,
     composite_shift,
+    composite_translate_pan,
     encode_task,
     integrate_u,
     lock_t0,
@@ -414,6 +416,80 @@ def test_demo_shift_feeds_the_shift_head(vae):
     # head starts at 2 * demo_shift (right direction, query is a higher level).
     shift0 = wrapper._shift_from_hidden(mem.embeds)
     assert torch.allclose(shift0, 2.0 * wrapper._demo_shift, atol=1e-4)
+
+
+def test_copy_decode_is_still_plus_residual_no_shift(vae):
+    """copy mode: no composite_shift, no shift loss, t=0 is the query still,
+    and identity decodes to the still with a zero-init residual."""
+    task = encode_task(vae, sample_task("identity", seed=0))
+    wrapper = BDHVideoReasoningWrapper(
+        make_video_model(scale="tiny"), canvas_update_memory=False,
+        motion_rank=0, decode="copy",
+    )
+    mem = wrapper.ingest_task(task)
+    assert wrapper._demo_shift is None  # not computed in copy mode
+    z = wrapper.reason(mem, 2, still=task["query_in"])
+    # zero-init to_latent -> residual 0 -> volume is the broadcast still
+    assert torch.allclose(z, task["query_in"][:, :, :1].expand_as(z), atol=1e-5)
+    _, parts = wrapper.train_loss(task, 2, return_parts=True)
+    assert "shift_mse" not in parts
+
+
+def test_copy_decode_learns_stamp_copy_overfit(vae):
+    """copy mode can drive the appearance/occupancy path: overfit stamp_copy
+    last-frame L1 falls well below the untrained still baseline."""
+    task = encode_task(vae, sample_task("stamp_copy", seed=1))
+    wrapper = BDHVideoReasoningWrapper(
+        make_video_model(scale="tiny"), canvas_update_memory=False,
+        motion_rank=0, decode="copy",
+    )
+    opt = torch.optim.AdamW(wrapper.parameters(), lr=1e-2)
+    start = wrapper.train_loss(task, 2, return_parts=True)[1]["last_mse"]
+    for _ in range(60):
+        loss = wrapper.train_loss(task, 2)
+        loss.backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+    end = wrapper.train_loss(task, 2, return_parts=True)[1]["last_mse"]
+    assert end < start * 0.5
+
+
+def test_composite_pan_holds_sprite_scrolls_bg():
+    still = torch.zeros(1, 24, 7, 8, 8)
+    still[:, 0, :, :, :] = 0.1  # textured bg
+    still[:, 1, :, :, :] = torch.linspace(0, 1, 8).view(1, 1, 8, 1)  # a gradient to move
+    still[:, 0, :, 2, 2] = 1.0  # bright sprite
+    z = composite_pan(still, torch.tensor([[2.0, 0.0]]))
+    assert torch.allclose(z[:, :, 0], still[:, :, 0], atol=1e-4)  # t=0 identity
+    assert float(z[0, 0, -1, 2, 2]) > 0.5  # sprite held at its screen cell
+    assert not torch.allclose(z[:, 1, -1], still[:, 1, -1], atol=1e-3)  # bg moved
+
+
+def test_composite_translate_pan_moves_sprite_and_bg_apart():
+    still = torch.zeros(1, 24, 7, 8, 8)
+    still[:, 1, :, :, :] = torch.linspace(0, 1, 8).view(1, 1, 8, 1)
+    still[:, 0, :, 1, 1] = 1.0
+    z = composite_translate_pan(
+        still, torch.tensor([[3.0, 0.0]]), torch.tensor([[0.0, 2.0]])
+    )
+    assert torch.allclose(z[:, :, 0], still[:, :, 0], atol=1e-4)
+    assert float(z[0, 0, -1, 4, 1]) > 0.4  # sprite translated down 3 cells
+    assert float(z[0, 0, -1, 1, 1]) < 0.3  # left its source
+
+
+def test_pan_decode_runs_end_to_end(vae):
+    task = encode_task(vae, sample_task("pan", seed=2))
+    wrapper = BDHVideoReasoningWrapper(
+        make_video_model(scale="tiny"), canvas_update_memory=False,
+        motion_rank=0, decode="pan",
+    )
+    mem = wrapper.ingest_task(task)
+    z = wrapper.reason(mem, 2, still=task["query_in"])
+    assert z.shape == task["query_out"].shape
+    assert torch.allclose(z[:, :, 0], task["query_in"][:, :, :1].squeeze(2), atol=1e-4)
+    loss, parts = wrapper.train_loss(task, 2, return_parts=True)
+    assert "shift_mse" in parts
+    loss.backward()
 
 
 def test_apply_residual_locks_t0_without_cumsum():
